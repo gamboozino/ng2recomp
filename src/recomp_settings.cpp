@@ -206,6 +206,8 @@ constexpr Setting kSettings[] = {
     {u"Input Latency", {u"Standard", u"Low"}, 2, "input_latency", Kind::kLevel},
     // The guest's vblanks on the display's refreshes (gpu/native_gpu.cpp).
     {u"Frame Pacing", {u"Auto", u"Timer"}, 2, "frame_pacing", Kind::kLevel},
+    // The player's attacks always cut a limb where they can (cheats.cpp).
+    {u"Always Cut Limbs", {u"On", u"Off"}, 2, "cheat_always_cut", Kind::kOnOff},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -260,9 +262,11 @@ constexpr Page kPages[] = {
      6},
     {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28)}}, 5},
     // (its name in the game's third category name, which holds 7 letters)
+    // Unlock Costumes last: the in-game menu has room for six of its seven
+    // rows (InGameCount), and that one is left out there.
     {u"Cheats", 3, 0x13E0, 0x1300,
-     {{Row(8), Row(9), Row(11), Row(24), Row(25), Row(26)}},
-     6},
+     {{Row(8), Row(9), Row(29), Row(24), Row(25), Row(26), Row(11)}},
+     7},
     {u"Interface", 4, 0x26A0, 0xAA0,
      {{Row(19), Row(23), Row(22), Row(7), Row(15), Row(16)}},
      6},
@@ -1893,13 +1897,25 @@ bool SetUpInGameRows(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// The rows of a page the in-game list shows: as many as fit after the
+// categories (its twelve rows hold the categories too, and only one row of
+// ours is added to the list's own). The rest are on the title's page only:
+// Cheats' seventh, Unlock Costumes, is left out in gameplay because only the
+// costume list reads it, which isn't reachable from there (a costume is
+// picked when a chapter or mission starts). A page with more rows than that
+// would need the list's methods to walk more rows.
+uint32_t InGameCount(const Page& page) {
+  return std::min(page.count, kGameRows - kFirstPageRow);
+}
 // The in-game list has a slot for a page's Restore Defaults after its rows
 // unless they fill the column (the title's pages still have it).
 bool InGameRestore(const Page& page) {
-  return kFirstPageRow + page.count < kGameRows;
+  return kFirstPageRow + InGameCount(page) < kGameRows;
 }
+// The title's pages: their rows and Restore Defaults in the model's eight
+// value slots (BuildPage).
 static_assert(std::all_of(std::begin(kPages), std::end(kPages),
-                          [](const Page& p) { return kFirstPageRow + p.count <= kGameRows; }));
+                          [](const Page& p) { return p.count < 8; }));
 
 // Restore Defaults after a page's rows, and the empty rows after it.
 void SetUpPageEnd(PPCContext& ctx, uint8_t* base, uint32_t restoreSlot) {
@@ -1935,7 +1951,7 @@ void NotifyCursor(PPCContext& ctx, uint8_t* base, uint32_t cursor) {
 // The shown page's values into its rows (by their slots).
 void PushValues(PPCContext& ctx, uint8_t* base) {
   const Page& page = kPages[g_category];
-  for (uint32_t j = 0; j < page.count; j++) {
+  for (uint32_t j = 0; j < InGameCount(page); j++) {
     uint32_t i = page.rows[j].setting;
     if (g_valueText[i]) {
       SetGuestText(g_valueText[i], ArrowText(kSettings[i]));
@@ -2031,12 +2047,12 @@ void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category
   for (uint32_t i = 0; i < kPageCount; i++) {
     rows[i] = g_categoryRows[i];
   }
-  for (uint32_t j = 0; j < page.count; j++) {
+  for (uint32_t j = 0; j < InGameCount(page); j++) {
     SetUpSettingRow(ctx, base, page.rows[j].setting, kFirstPageRow + j);
     rows[kFirstPageRow + j] = g_settingRows[page.rows[j].setting];
     PlacePageRow(rows[kFirstPageRow + j], true);
   }
-  uint32_t restoreSlot = kFirstPageRow + page.count;
+  uint32_t restoreSlot = kFirstPageRow + InGameCount(page);
   SetUpPageEnd(ctx, base, restoreSlot);
   if (InGameRestore(page)) {
     rows[restoreSlot] = g_restoreRow;
@@ -2056,7 +2072,7 @@ void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category
   }
   // A row shows a value once it changes: the slots may hold another
   // page's, so each is changed twice.
-  for (uint32_t j = 0; j < page.count; j++) {
+  for (uint32_t j = 0; j < InGameCount(page); j++) {
     CallGuest(ctx, base, __imp__sub_83691458, {kFirstPageRow + j, 0xFF});
   }
   PushValues(ctx, base);
@@ -2263,7 +2279,8 @@ REX_HOOK_RAW(sub_823E8720) {
       // A page: up and down pick a row, left and right change it, Y sets its
       // default, Confirm on Restore Defaults sets the page's.
       const Page& page = kPages[g_category];
-      uint32_t rowCount = page.count + (InGameRestore(page) ? 1 : 0);
+      uint32_t shownCount = InGameCount(page);
+      uint32_t rowCount = shownCount + (InGameRestore(page) ? 1 : 0);
       uint32_t row = std::min(cursor - std::min(cursor, kFirstPageRow), rowCount - 1);
       uint32_t moved = row;
       if (pressed(0)) {
@@ -2277,7 +2294,7 @@ REX_HOOK_RAW(sub_823E8720) {
         row = moved;
       }
       cursor = kFirstPageRow + row;
-      if (row == page.count) {
+      if (row == shownCount) {
         if (CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
           CallGuest(ctx, base, __imp__sub_8242AFC0, {3}, sound);
           for (uint32_t i = 0; i < page.count; i++) {

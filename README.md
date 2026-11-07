@@ -162,7 +162,8 @@ each defaults to the game's own behaviour.
   runs as Timer). Timer is the default: use it on a variable-refresh display, G-Sync or FreeSync.
   In the Steam Deck's Game Mode (and any game run through gamescope) Auto acts as Timer: there it
   gave me uneven frame pacing
-- **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Unlock Costumes;
+- **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Always Cut Limbs
+  (the player's attacks cut a limb wherever they can); Unlock Costumes (on the title's page only);
   All Weapons and Ninpo (Level 1 or 3: every melee and projectile weapon, ninpo and ammo, given at a
   new game, a load and a stage's start; what it gives stays in the save when it's turned off, as
   items found); All Crystal Skulls; Max HP and Ninpo (the life and ninpo upgrades full while it's

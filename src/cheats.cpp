@@ -33,10 +33,21 @@
 // Neither writes the unlocks to the profile (a game played on a difficulty
 // or in a costume they open is saved as usual): switched off, the menus
 // are as before.
+//
+// Always Cut Limbs: a reaction rule can ask for a chance roll:
+// sub_823A95E0(r3 attacker record, r4 kind, f1 scale) reads a percentage
+// from the attack's data (sub_823A81C8(record, 12, attack), the u16 at +12)
+// and rolls rand() * 100 / 32768 against it (0: never, 100: always). The
+// cut reactions are such rolls, high for strong attacks and low (or 0) for
+// light ones. For the player's hits (the attacker is the player's record)
+// the attack's chance is set to 100 and the roll's answer is yes. Forcing
+// the reaction rule instead broke Obliteration. The chances are put back
+// when it's turned off.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -50,6 +61,8 @@ REXCVAR_DEFINE_BOOL(cheat_infinite_ninpo, false, "Cheats", "Casting ninpo doesn'
 REXCVAR_DEFINE_BOOL(cheat_unlock_difficulties, false, "Cheats",
                     "Every difficulty in New Game and Mission Mode");
 REXCVAR_DEFINE_BOOL(cheat_unlock_costumes, false, "Cheats", "Every costume");
+REXCVAR_DEFINE_BOOL(cheat_always_cut, false, "Cheats",
+                    "The player's attacks always cut a limb where they can");
 
 namespace {
 
@@ -201,5 +214,75 @@ void FillPlayerNinpo() {
   if (most && most <= 0x2000 && ng2::guest::Load16(player + kNinpo) < most) {
     uint16_t value = rex::byte_swap(most);
     std::memcpy(ng2::guest::Virtual(player + kNinpo), &value, 2);
+  }
+}
+
+// Always Cut Limbs (see the top).
+namespace {
+
+constexpr uint32_t kRecords = 0x84C3DC60;     // 24 bytes a record; the player's first
+constexpr uint32_t kTypeTables = 0x83AA56C8;  // by a record's +10; +240: the attack's offset
+constexpr uint32_t kChance = 12;              // in an attack's data (u16, percent)
+
+// An attack's data set to 100, with what it held: put back when the setting
+// is turned off, where the data still is that attack at 100 (a room's data
+// can be gone and its memory reused).
+struct CutPatch {
+  uint32_t data;
+  uint16_t attack, chance;
+};
+std::vector<CutPatch> g_cutPatches;
+
+void SetChance(uint32_t data, uint16_t chance) {
+  uint16_t value = rex::byte_swap(chance);
+  std::memcpy(ng2::guest::Virtual(data + kChance), &value, 2);
+}
+
+void UndoCutPatches() {
+  for (const CutPatch& p : g_cutPatches) {
+    if (ng2::guest::Load16(p.data + 4) == p.attack && ng2::guest::Load16(p.data + kChance) == 100) {
+      SetChance(p.data, p.chance);
+    }
+  }
+  g_cutPatches.clear();
+}
+
+}  // namespace
+
+REX_EXTERN(sub_823A81C8);  // (record, table, id, 0, 0, 0): a data record
+
+// The attack a roll is for, as sub_823A95E0 finds it (the u16 at the
+// attacker's character + the type table's +240 offset), and its data.
+uint32_t AttackData(PPCContext& ctx, uint8_t* base, uint32_t record) {
+  uint8_t type = ng2::guest::Virtual(record)[10];
+  uint16_t attack = type == 0xFF ? 0
+                                 : ng2::guest::Load16(ng2::guest::Load32(record) +
+                                                      ng2::guest::Load32(kTypeTables + 240 + 4 * type));
+  PPCRegister r3 = ctx.r3, r4 = ctx.r4, r5 = ctx.r5, r6 = ctx.r6, r7 = ctx.r7, r8 = ctx.r8;
+  ctx.r4.u64 = 12, ctx.r5.u64 = attack, ctx.r6.u64 = 0, ctx.r7.u64 = 0, ctx.r8.u64 = 0;
+  sub_823A81C8(ctx, base);
+  uint32_t data = ctx.r3.u32;
+  ctx.r3 = r3, ctx.r4 = r4, ctx.r5 = r5, ctx.r6 = r6, ctx.r7 = r7, ctx.r8 = r8;
+  return data;
+}
+
+REX_EXTERN(__imp__sub_823A95E0);
+REX_HOOK_RAW(sub_823A95E0) {
+  bool on = REXCVAR_GET(cheat_always_cut);
+  bool player = on && ctx.r3.u32 == kRecords;
+  if (!on && !g_cutPatches.empty()) {
+    UndoCutPatches();
+  }
+  if (player) {
+    uint32_t data = AttackData(ctx, base, ctx.r3.u32);
+    if (data && ng2::guest::Load16(data + kChance) < 100) {
+      g_cutPatches.push_back({data, ng2::guest::Load16(data + 4), ng2::guest::Load16(data + kChance)});
+      SetChance(data, 100);
+    }
+  }
+  __imp__sub_823A95E0(ctx, base);
+  // Every chance roll of the player's hits succeeds, not only the cut ones.
+  if (player) {
+    ctx.r3.u64 = 1;
   }
 }
