@@ -73,6 +73,9 @@ devices, and none of the player's settings or saves.
   time ("threads, ms of CPU each second"; "(renderer)" is the game's render thread, "Render
   Commands" ours). `NG2_HITCHES=1` (or `log_hitches`): slow frames with what they were spent on.
   `NG2_FPS_LOG=1`: the game's frame rate once a second.
+- `NG2_PIPELINE_STATS=1`: what the driver compiled each shader pair to, logged once a pair (registers,
+  scratch, instructions; VK_KHR_pipeline_executable_properties, plume patch 0011). On AMD the vertex
+  stage is `ShaderProperties.gs`; `scratchMemUsageInBytes` above 0 there means spilled registers.
 - `NG2_LATENCY_LOG=1`: every 10 s, from the game reading the pad to that frame's present and to its
   reaching the screen (the display clock, VK_KHR_present_wait). `NG2_TEST_REFRESH=59` (run-headless.sh)
   sets the headless display's rate.

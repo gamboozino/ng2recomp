@@ -3285,6 +3285,38 @@ struct PipelineKey {
 };
 static_assert(sizeof(PipelineKey) == 96);
 
+// NG2_PIPELINE_STATS=1: the driver's statistics of each shader pair's first
+// pipeline (VK_KHR_pipeline_executable_properties: registers, scratch,
+// instructions), to see what a slow draw's shaders compiled to on a driver
+// that has no other way to show it (#2, AMD's Windows driver).
+void LogPipelineStatistics(const PipelineKey& key, const RenderPipeline& pipeline) {
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> logged;
+  uint64_t pair = key.vertexShader * 31 + key.pixelShader;
+  {
+    std::lock_guard lock(mutex);
+    if (!logged.insert(pair).second) {
+      return;
+    }
+  }
+  std::string text = pipeline.getStatistics();
+  if (text.empty()) {
+    REXLOG_INFO("video: pipeline vs {:016X} ps {:016X}: no statistics from the driver",
+                key.vertexShader, key.pixelShader);
+    return;
+  }
+  for (size_t begin = 0, end; begin < text.size(); begin = end + 1) {
+    end = text.find('\n', begin);
+    if (end == std::string::npos) {
+      end = text.size();
+    }
+    if (end > begin) {
+      REXLOG_INFO("video: pipeline vs {:016X} ps {:016X} {}", key.vertexShader, key.pixelShader,
+                  std::string_view(text).substr(begin, end - begin));
+    }
+  }
+}
+
 std::unique_ptr<RenderPipeline> MakePipeline(const PipelineKey& key, RenderShader* vertexShader,
                                              RenderShader* pixelShader) {
   RenderGraphicsPipelineDesc desc;
@@ -3380,7 +3412,13 @@ std::unique_ptr<RenderPipeline> MakePipeline(const PipelineKey& key, RenderShade
   RenderSpecConstant specConstant(0, key.alphaTest ? 0x2u : 0u);  // SPEC_CONSTANT_ALPHA_TEST
   desc.specConstants = &specConstant;
   desc.specConstantsCount = 1;
-  return g_device->createGraphicsPipeline(desc);
+  static const bool statistics = std::getenv("NG2_PIPELINE_STATS") != nullptr;
+  desc.captureStatistics = statistics;
+  auto pipeline = g_device->createGraphicsPipeline(desc);
+  if (statistics && pipeline) {
+    LogPipelineStatistics(key, *pipeline);
+  }
+  return pipeline;
 }
 
 // Pipelines are made on worker threads (async_pipelines): a draw whose
