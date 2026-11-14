@@ -1164,6 +1164,9 @@ RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16:
       return RenderFormat::R8G8B8A8_UNORM;
     case xenos::TextureFormat::k_2_10_10_10:
+    // (the lens flare's sun test resolves its 1x1 counts into these: without
+    // a host texture they were dropped and the flare read stale memory, #95)
+    case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16:
     case xenos::TextureFormat::k_16_16_16_16:
       return RenderFormat::R16G16B16A16_UNORM;
     case xenos::TextureFormat::k_16_16_16_16_FLOAT:
