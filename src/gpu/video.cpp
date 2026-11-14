@@ -934,6 +934,16 @@ int64_t g_traceFrames = 0, g_traceLeft = 0;
 // F7's first frame: each draw's vertex shader constants (256 x 16 bytes, as
 // the guest has them: big-endian), in draw order, beside its draw lines.
 FILE* g_traceConstants = nullptr;
+// NG2_TRACE_ALL_CONSTANTS=1: every traced frame's, and the pixel shader
+// constants (224 x 16 bytes) into ps-constants-<n>.bin too.
+FILE* g_tracePsConstants = nullptr;
+bool TraceAllConstants() {
+  static const bool all = [] {
+    const char* v = std::getenv("NG2_TRACE_ALL_CONSTANTS");
+    return v && *v == '1';
+  }();
+  return all;
+}
 thread_local std::string g_drawStack;  // NG2_TRACE_STACKS: the last draw's guest call chain
 
 bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
@@ -5224,6 +5234,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   Upload vsConstants = Allocate(256 * 16);
   if (g_traceConstants) {
     std::fwrite(guest::Virtual(device + 0x780), 1, 256 * 16, g_traceConstants);
+    if (g_tracePsConstants) {
+      std::fwrite(guest::Virtual(device + 0x1780), 1, 224 * 16, g_tracePsConstants);
+    }
   }
   Upload psConstants = Allocate(224 * 16);
   const uint32_t* vsSource = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x780));
@@ -5738,8 +5751,11 @@ void TraceFrame(HostTexture* frontBuffer) {
     if (g_traceFile && !std::getenv("NG2_TRACE_NOMEMORY") && !TracePicturesOnly()) {
       WriteTraceMemory(fmt::format("{}/memory-{}.zst", g_traceDir, g_frameCount));
       g_traceConstants = std::fopen(fmt::format("{}/vs-constants-{}.bin", g_traceDir, g_frameCount).c_str(), "wb");
+      if (TraceAllConstants()) {
+        g_tracePsConstants = std::fopen(fmt::format("{}/ps-constants-{}.bin", g_traceDir, g_frameCount).c_str(), "wb");
+      }
     }
-  } else if (g_traceConstants) {
+  } else if (g_traceConstants && !TraceAllConstants()) {
     std::fclose(g_traceConstants);  // the first frame's only
     g_traceConstants = nullptr;
   }
@@ -5780,6 +5796,12 @@ void TraceFrame(HostTexture* frontBuffer) {
   if (!opened && --g_traceLeft <= 0) {
     std::fclose(g_traceFile);
     g_traceFile = nullptr;
+    for (FILE** f : {&g_traceConstants, &g_tracePsConstants}) {
+      if (*f) {
+        std::fclose(*f);
+        *f = nullptr;
+      }
+    }
     REXLOG_INFO("video: trace done: {}", g_traceDir);
   }
 }
@@ -7318,10 +7340,10 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
     return;
   }
   uint32_t width = dest.width / dest.scale, height = dest.height / dest.scale;
-  // An F7 trace also writes the small resolves (up to 256x256: a reflection,
+  // An F7 trace also writes the small resolves (up to 512x512: a shadow map, a reflection,
   // a ripple map) as the GPU holds them, into its folder.
-  bool dump = g_traceFile && !g_traceDir.empty() && Tracing() && width && height && width <= 256 &&
-              height <= 256;
+  bool dump = g_traceFile && !g_traceDir.empty() && Tracing() && width && height && width <= 512 &&
+              height <= 512;
   bool toGuest = width && height && width <= kReadbackSide && height <= kReadbackSide;
   if (!toGuest && !dump) {
     return;
