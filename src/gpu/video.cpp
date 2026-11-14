@@ -5642,12 +5642,15 @@ void WriteTracePicture() {
 
 // F7's memory: every readable mapping inside guest memory, as records of
 // <guest address u32><size u32><bytes>, zstd-compressed, for finding what the
-// game held in the traced frame.
+// game held in the traced frame. The mappings come from /proc/self/maps on
+// Linux and VirtualQuery on Windows.
 void WriteTraceMemory(const std::string& path) {
   uintptr_t low = reinterpret_cast<uintptr_t>(guest::Virtual(0));
   uintptr_t high = low + 0x100000000ull;
-  FILE* maps = std::fopen("/proc/self/maps", "r");
   FILE* file = std::fopen(path.c_str(), "wb");
+  if (!file) {
+    return;
+  }
   ZSTD_CCtx* zstd = ZSTD_createCCtx();
   ZSTD_CCtx_setParameter(zstd, ZSTD_c_compressionLevel, 1);
   std::vector<uint8_t> out(ZSTD_CStreamOutSize());
@@ -5660,27 +5663,46 @@ void WriteTraceMemory(const std::string& path) {
       std::fwrite(out.data(), 1, o.pos, file);
     } while (!ZSTD_isError(left) && (in.pos < in.size || (end == ZSTD_e_end && left)));
   };
-  char line[512];
-  while (maps && file && std::fgets(line, sizeof(line), maps)) {
-    unsigned long a = 0, b = 0;
-    char perms[8] = {};
-    if (std::sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3 || perms[0] != 'r') {
-      continue;
-    }
+  // One readable range [a, b), clipped to guest memory, in records of up to 16 MB.
+  auto range = [&](uintptr_t a, uintptr_t b) {
     uintptr_t start = std::max<uintptr_t>(a, low), end = std::min<uintptr_t>(b, high);
     for (uintptr_t at = start; at < end; at += 0x1000000) {
       uint32_t header[2] = {uint32_t(at - low), uint32_t(std::min<uintptr_t>(end - at, 0x1000000))};
       write(header, sizeof(header), ZSTD_e_continue);
       write(reinterpret_cast<const void*>(at), header[1], ZSTD_e_continue);
     }
+  };
+#if defined(_WIN32)
+  for (uintptr_t at = low; at < high;) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) {
+      break;
+    }
+    uintptr_t end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    bool readable = info.State == MEM_COMMIT && !(info.Protect & PAGE_GUARD) && (info.Protect & kReadable);
+    if (readable) {
+      range(at, end);
+    }
+    at = std::max(end, at + 0x1000);
   }
-  if (file) {
-    write(nullptr, 0, ZSTD_e_end);
-    std::fclose(file);
+#else
+  FILE* maps = std::fopen("/proc/self/maps", "r");
+  char line[512];
+  while (maps && std::fgets(line, sizeof(line), maps)) {
+    unsigned long a = 0, b = 0;
+    char perms[8] = {};
+    if (std::sscanf(line, "%lx-%lx %7s", &a, &b, perms) == 3 && perms[0] == 'r') {
+      range(a, b);
+    }
   }
   if (maps) {
     std::fclose(maps);
   }
+#endif
+  write(nullptr, 0, ZSTD_e_end);
+  std::fclose(file);
   ZSTD_freeCCtx(zstd);
 }
 
@@ -7122,6 +7144,8 @@ struct ResolveReadbackItem {
   RenderFormat format = RenderFormat::UNKNOWN;
   const RenderBuffer* buffer = nullptr;
   uint64_t offset = 0;  // into the buffer
+  bool toGuest = true;    // written into guest memory (else only dumped)
+  std::string dumpPath;   // F7 trace: the host texels written raw to this file
 };
 struct ResolveReadback {
   std::unique_ptr<RenderBuffer> buffer;
@@ -7291,28 +7315,45 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
     return;
   }
   uint32_t width = dest.width / dest.scale, height = dest.height / dest.scale;
-  if (!width || !height || width > kReadbackSide || height > kReadbackSide) {
+  // An F7 trace also writes the small resolves (up to 256x256: a reflection,
+  // a ripple map) as the GPU holds them, into its folder.
+  bool dump = g_traceFile && !g_traceDir.empty() && Tracing() && width && height && width <= 256 &&
+              height <= 256;
+  bool toGuest = width && height && width <= kReadbackSide && height <= kReadbackSide;
+  if (!toGuest && !dump) {
     return;
   }
   TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
   // (a texel at least the endian swap's word: the swap is done per texel)
   uint32_t swapWord = fetch.endianness == xenos::Endian::k8in16 ? 2
                       : fetch.endianness == xenos::Endian::kNone ? 1 : 4;
-  if (info.format == RenderFormat::UNKNOWN || info.blockSize != 1 ||
-      info.bytesPerBlock != RenderFormatSize(dest.format) || info.bytesPerBlock > 16 ||
-      info.bytesPerBlock < swapWord) {
+  if (toGuest && (info.format == RenderFormat::UNKNOWN || info.blockSize != 1 ||
+                  info.bytesPerBlock != RenderFormatSize(dest.format) || info.bytesPerBlock > 16 ||
+                  info.bytesPerBlock < swapWord)) {
     static std::unordered_set<uint32_t> reported;
     if (reported.insert(uint32_t(fetch.format)).second) {
       REXLOG_INFO("video: resolves to texture format {} aren't read back for the CPU",
                   uint32_t(fetch.format));
     }
-    return;
+    toGuest = false;
+    if (!dump) {
+      return;
+    }
+  }
+  if (!toGuest) {
+    info.bytesPerBlock = RenderFormatSize(dest.format);
   }
   ResolveReadback& r = g_resolveReadbacks[g_frame];
   uint32_t rowWidth = (dest.width + 63) & ~63u;
   uint64_t size = uint64_t(rowWidth) * dest.height * info.bytesPerBlock;
-  if (size > (1u << 20)) {
-    return;  // (at a high render scale: the game's own values aren't that big)
+  if (toGuest && size > (1u << 20)) {
+    toGuest = false;  // (as without a trace: too big to be one the game reads back)
+    if (!dump) {
+      return;
+    }
+  }
+  if (size > (16u << 20)) {
+    return;  // (a trace's dump: up to 16 MB)
   }
   uint64_t offset = (r.used + 511) & ~511ull;
   if (!r.buffer || offset + size > r.capacity) {
@@ -7339,8 +7380,17 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
   item.address = address, item.fetch = fetch, item.info = info;
   item.width = width, item.height = height, item.scale = dest.scale, item.rowWidth = rowWidth;
   item.format = dest.format, item.buffer = r.buffer.get(), item.offset = offset;
+  item.toGuest = toGuest;
+  if (dump) {
+    static uint32_t n = 0;
+    item.dumpPath = fmt::format("{}/resolve-{}-{:03}-{:08x}-{}x{}-host{}.raw", g_traceDir, g_frameCount,
+                                n++, address, dest.width, dest.height, uint32_t(dest.format));
+  }
   r.items.push_back(item);
   r.used = offset + size;
+  if (!toGuest) {
+    return;
+  }
   static std::unordered_set<uint64_t> logged;
   if (logged.insert(uint64_t(address) << 32 | width << 16 | height).second) {
     REXLOG_INFO("video: resolve {}x{} texture format {} at {:#x} read back for the CPU", width,
@@ -7408,8 +7458,18 @@ void ApplyResolveReadbacks(uint32_t frame) {
         mapped = item.buffer;
         data = static_cast<const uint8_t*>(const_cast<RenderBuffer*>(mapped)->map());
       }
-      if (data) {
+      if (data && item.toGuest) {
         WriteResolveReadback(item, data);
+      }
+      if (data && !item.dumpPath.empty()) {
+        if (FILE* f = std::fopen(item.dumpPath.c_str(), "wb")) {
+          uint32_t bytes = RenderFormatSize(item.format);
+          for (uint32_t y = 0; y < item.height * item.scale; y++) {
+            std::fwrite(data + item.offset + uint64_t(y) * item.rowWidth * bytes, bytes,
+                        item.width * item.scale, f);
+          }
+          std::fclose(f);
+        }
       }
     }
     if (data) {
