@@ -221,7 +221,9 @@ was. `mod.toml` is optional:
 
 Mods are read at start, in their folders' name order: when two replace the same file, the first
 one's is used. The log (`ng2.log`) lists each mod and the files it brings. To find which file to
-replace, set `log_file_loads = true` in `ng2.toml`: the log then names every file the game loads.
+replace, look in `game-files.txt` in the mods folder (every file's path, written by the game at its
+first start), or set `log_file_loads = true` in `ng2.toml`: the log then names every file the game
+loads.
 
 ## Controls
 
