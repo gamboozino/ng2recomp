@@ -141,6 +141,11 @@ constexpr uint32_t kNoteSlot = 0x39;
 constexpr std::u16string_view kAllWeaponsNote = u"Weapons given stay in your saves, even turned off.";
 // Frame Interpolation's description (placed with the labels).
 constexpr std::u16string_view kInterpNote = u"Experimental: pictures between the game's frames.";
+// Frame Rate's description (high_fps/high_fps.cpp).
+constexpr std::u16string_view kNative120Note =
+    u"60 Hz game logic with fixed 120 FPS or Variable (VFR) rendering.";
+// VFR FPS Limit's description (high_fps/high_fps.cpp).
+constexpr std::u16string_view kVfrLimitNote = u"Frame rate cap for Variable (VFR) mode.";
 // Base Resolution's (base_resolution.cpp).
 constexpr std::u16string_view kBaseResolutionNote = u"Takes effect after a restart.";
 // The Music Test's track names: room for our texts.
@@ -152,12 +157,14 @@ constexpr uint32_t kSlotCount = 0x380;
 
 enum class Kind {
   kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize, kSamples, kAspect,
-  kSensitivity
+  kSensitivity, kVfrLimit
 };
 // Mouse Sensitivity's choices (mnk_sensitivity).
 constexpr double kSensitivities[] = {0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0};
 // Render Scale's choices (render_scale).
 constexpr double kScales[] = {1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+// VFR FPS Limit's choices (vfr_fps_limit; -1 = display refresh minus 3 Hz for VRR).
+constexpr int32_t kVfrLimits[] = {0, 120, 144, 165, 240, -1};
 struct Setting {
   std::u16string_view label;
   std::array<std::u16string_view, 10> choices;
@@ -253,6 +260,15 @@ constexpr Setting kSettings[] = {
     // The size the game's 3D is drawn at before Render Scale (experimental,
     // base_resolution.cpp; after a restart).
     {u"Base Resolution", {u"1280x720", u"1120x584"}, 2, "base_resolution_720p", Kind::kOnOff},
+    // Frame Rate mode: 0 = 60 FPS, 1 = 120 FPS (Fixed), 2 = Variable (VFR)
+    // (high_fps/high_fps.cpp; mutually exclusive with Frame Interpolation).
+    {u"Frame Rate", {u"60 FPS", u"120 FPS (Fixed)", u"Variable (VFR)"}, 3, "frame_rate_mode", Kind::kLevel},
+    // VFR frame rate cap (high_fps/high_fps.cpp).
+    {u"VFR FPS Limit",
+     {u"Unlimited", u"120 FPS", u"144 FPS", u"165 FPS", u"240 FPS", u"Display - 3 (VRR)"},
+     6,
+     "vfr_fps_limit",
+     Kind::kVfrLimit},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -323,7 +339,9 @@ constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
      {{Row(0), Row(37), Row(3), Row(1), Row(21), Row(33), Row(30), Row(2), Row(20)}},
      9},
-    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28), Row(29)}}, 6},
+    {u"Display", 2, 0x1CC0, 0x1A20,
+     {{Row(4), Row(5), Row(14), Row(6), Row(28), Row(38), Row(39), Row(29)}},
+     8},
     // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
      {{Row(8), Row(9), Row(34), Row(35), Row(11), Row(24), Row(25), Row(26)}},
@@ -456,7 +474,8 @@ void Override(uint32_t slot, std::u16string_view text) {
 // Each of our texts a spare id of the Options table (its strings unused by
 // Options), given our text by the lookup.
 void PlaceTexts() {
-  std::vector<std::u16string_view> texts{kRestoreText, kInterpNote, kBaseResolutionNote};
+  std::vector<std::u16string_view> texts{kRestoreText, kInterpNote, kNative120Note, kVfrLimitNote,
+                                         kBaseResolutionNote};
   for (const Setting& setting : kSettings) {
     texts.push_back(setting.label);
     // List values are strings of ours (ListString); only choice rows'
@@ -667,6 +686,12 @@ uint32_t ValueOf(const Setting& setting) {
       if (std::string_view(setting.name) == "button_prompts" && GetInt(setting.name) >= int32_t(setting.count)) {
         return 0;
       }
+      // Migrate older native_120fps = true when frame_rate_mode has not been set yet.
+      if (std::string_view(setting.name) == "frame_rate_mode" && !g_written.contains(setting.name) &&
+          rex::cvar::GetFlagSource(setting.name) == rex::cvar::Source::kDefault &&
+          GetSetting("native_120fps") == "true") {
+        return 1;
+      }
       return uint32_t(std::clamp(GetInt(setting.name), 0, int32_t(setting.count) - 1));
     case Kind::kSensitivity: {
       double value = std::atof(GetSetting(setting.name).c_str());
@@ -704,6 +729,22 @@ uint32_t ValueOf(const Setting& setting) {
         }
       }
       return 0;
+    case Kind::kVfrLimit: {
+      int32_t limit = GetInt(setting.name);
+      if (limit < 0) {
+        return uint32_t(std::size(kVfrLimits) - 1);
+      }
+      if (limit == 0) {
+        return 0;
+      }
+      uint32_t nearest = 1;
+      for (uint32_t i = 2; i < std::size(kVfrLimits) - 1; i++) {
+        if (std::abs(kVfrLimits[i] - limit) < std::abs(kVfrLimits[nearest] - limit)) {
+          nearest = i;
+        }
+      }
+      return nearest;
+    }
   }
   return 0;
 }
@@ -868,6 +909,16 @@ void SetValue(const Setting& setting, uint32_t value) {
       break;
     case Kind::kLevel:
       SetSetting(setting.name, std::to_string(value));
+      // Frame Interpolation and Frame Rate modes (120 FPS / VFR) are mutually exclusive.
+      if (std::string_view(setting.name) == "frame_interpolation" && value != 0) {
+        SetSetting("frame_rate_mode", "0");
+        SetSetting("native_120fps", "false");
+      } else if (std::string_view(setting.name) == "frame_rate_mode") {
+        SetSetting("native_120fps", value == 1 ? "true" : "false");
+        if (value != 0) {
+          SetSetting("frame_interpolation", "0");
+        }
+      }
       break;
     case Kind::kSensitivity:
       SetSetting(setting.name, fmt::format("{}", kSensitivities[std::min<size_t>(value, std::size(kSensitivities) - 1)]));
@@ -908,6 +959,10 @@ void SetValue(const Setting& setting, uint32_t value) {
       SetSetting("windowed_width", std::to_string(WindowSizes()[value].width));
       SetSetting("windowed_height", std::to_string(WindowSizes()[value].height));
       break;
+    case Kind::kVfrLimit:
+      SetSetting(setting.name,
+                 std::to_string(kVfrLimits[std::min<size_t>(value, std::size(kVfrLimits) - 1)]));
+      break;
   }
 }
 
@@ -926,7 +981,9 @@ void RestoreDefault(const Setting& setting) {
     }
   };
   reset(setting.name);
-  if (setting.kind == Kind::kPresent) {
+  if (std::string_view(setting.name) == "frame_rate_mode") {
+    reset("native_120fps");
+  } else if (setting.kind == Kind::kPresent) {
     reset("vsync");
   } else if (setting.kind == Kind::kWindowMode) {
     reset(kExclusive);
@@ -1516,7 +1573,21 @@ bool InBuild(uint32_t address) {
   return g_building && address - g_building < g_buildingSize;
 }
 
-// Window Size's list after the aspect ratio changed: the new sizes.
+// Refreshes a single setting's title-screen list widget after a coupled
+// setting (e.g. mutual exclusion between native_120fps and frame_interpolation)
+// changed its value.
+void RefreshSettingWidget(std::string_view name) {
+  using ng2::guest::Load32;
+  for (uint32_t i = 0; i < std::size(kSettings); i++) {
+    uint32_t widget = g_listWidgets[i];
+    if (kSettings[i].name != name || !widget) {
+      continue;
+    }
+    uint32_t value = ValueOf(kSettings[i]);
+    Store32(widget + kListShown, Load32(widget + kListTexts + 4 * value));
+    Store32(widget + kWidgetValue, value);
+  }
+}
 void RefreshWindowSizes(PPCContext& ctx, uint8_t* base) {
   using ng2::guest::Load32;
   for (uint32_t i = 0; i < std::size(kSettings); i++) {
@@ -1915,6 +1986,10 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
         SetValue(setting, changed);
         if (setting.kind == Kind::kAspect) {
           RefreshWindowSizes(ctx, base);
+        } else if (std::string_view(setting.name) == "frame_rate_mode") {
+          RefreshSettingWidget("frame_interpolation");
+        } else if (std::string_view(setting.name) == "frame_interpolation") {
+          RefreshSettingWidget("frame_rate_mode");
         }
       } else if (CallGuest(ctx, base, __imp__sub_823E43B0, {kPadState})) {
         RestoreDefault(setting);
@@ -2206,6 +2281,8 @@ REX_HOOK_RAW(sub_836D6AC8) {
   SetDescriptionText(page->custom                       ? kEmpty
                      : row == page->count               ? kRestoreDescription
                      : name == "cheat_all_weapons"      ? (kTable | kNoteSlot)
+                     : name == "frame_rate_mode"        ? TextId(kNative120Note)
+                     : name == "vfr_fps_limit"          ? TextId(kVfrLimitNote)
                      : name == "frame_interpolation"    ? TextId(kInterpNote)
                      : name == "base_resolution_720p"   ? TextId(kBaseResolutionNote)
                                                         : kEmpty);
@@ -2619,6 +2696,8 @@ bool g_inGameShownOrder = false;  // the game's rows placed with ours among them
 // is the cursor's.
 std::u16string_view NoteOf(std::string_view name) {
   return name == "cheat_all_weapons"      ? kAllWeaponsNote
+         : name == "frame_rate_mode"      ? kNative120Note
+         : name == "vfr_fps_limit"        ? kVfrLimitNote
          : name == "frame_interpolation"  ? kInterpNote
          : name == "base_resolution_720p" ? kBaseResolutionNote
                                           : std::u16string_view();

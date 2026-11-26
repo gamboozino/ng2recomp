@@ -39,6 +39,7 @@
 #include "win_display.h"
 #include "native_gpu.h"
 #include "video.h"
+#include "../high_fps/high_fps.h"
 
 #include <algorithm>
 #include <atomic>
@@ -367,12 +368,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   int VsyncThread() {
     rex::system::X_VIDEO_MODE mode;
     rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
-    double hz = std::max(1.0, double(float(mode.refresh_rate)));
+    double baseHz = std::max(1.0, double(float(mode.refresh_rate)));
     uint64_t frequency = rex::chrono::Clock::guest_tick_frequency();
-    uint64_t vsyncInterval = std::max<uint64_t>(1, uint64_t(double(frequency) / hz));
     uint64_t freeInterval = std::max<uint64_t>(1, frequency / 1000);
     uint64_t last = rex::chrono::Clock::QueryGuestTickCount();
-    const int64_t guestPeriodNs = int64_t(1e9 / hz);
     int64_t lastVblankNs = 0;
     int64_t lastTargetNs = 0;  // the locked vblanks' last target (0: unlocked since)
     bool lockedLogged = false;
@@ -381,6 +380,31 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     bool skipNext = false;
     while (running_) {
       int64_t refreshNs = 0, periodNs = 0;
+      const bool haveRefresh = ng2::video::DisplayRefresh(&refreshNs, &periodNs);
+      int32_t presentMode = REXCVAR_GET(present_mode);
+      const bool can120 = [&] {
+        if (!ng2::high_fps::Enabled() || ng2::high_fps::IsVfrActive() ||
+            ng2::high_fps::OverloadDegraded()) {
+          return false;
+        }
+        if (const char* v = std::getenv("NG2_TEST_REFRESH"); v && std::atoi(v) >= 115) {
+          return true;
+        }
+        if (!REXCVAR_GET(vsync) || presentMode == 0 || presentMode == 2) {
+          return true;
+        }
+        if (haveRefresh && periodNs > 0) {
+          return periodNs <= 8'695'652;
+        }
+        if (int64_t modePeriodNs = ng2::video::ModeRefreshNs(); modePeriodNs > 0) {
+          return modePeriodNs <= 8'695'652;
+        }
+        return false;
+      }();
+      ng2::high_fps::SetVblank120Active(can120);
+      const double hz = can120 ? baseHz * 2.0 : baseHz;
+      const uint64_t vsyncInterval = std::max<uint64_t>(1, uint64_t(double(frequency) / hz));
+      const int64_t guestPeriodNs = int64_t(1e9 / hz);
       // (FIFO, Mailbox and Adaptive: there the presents reach the screen on
       // its refreshes, Adaptive's when on time, as they are once locked; with
       // V-Sync Off they show at once. Adaptive left out, its vblanks ran on the
@@ -396,12 +420,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         }
         return on;
       }();
-      int32_t presentMode = REXCVAR_GET(present_mode);
       const bool lowLock = ng2::video::LowLocksVblanks();
       if (REXCVAR_GET(vsync) && (REXCVAR_GET(frame_pacing) == 0 || lowLock) &&
+          !ng2::high_fps::IsVfrActive() &&
           (!ng2::video::UnderGamescope() || gamescopeAuto || lowLock) &&
-          (presentMode == 1 || presentMode == 2 || presentMode == 3) &&
-          ng2::video::DisplayRefresh(&refreshNs, &periodNs)) {
+          (presentMode == 1 || presentMode == 2 || presentMode == 3) && haveRefresh) {
         int64_t every = std::clamp<int64_t>((guestPeriodNs + periodNs / 2) / periodNs, 1, 4);
         int64_t step = periodNs * every;
         if (std::abs(step - guestPeriodNs) * 50 < guestPeriodNs) {
@@ -461,7 +484,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       static bool refilling = false;
       static int64_t refillStartNs = 0, refillPausedUntilNs = 0, refillPauseNs = 10'000'000'000;
       static int refillsLogged = 0;
-      bool drained = ng2::video::PresentQueueDrained();
+      bool drained = !can120 && !ng2::high_fps::IsVfrActive() && ng2::video::PresentQueueDrained();
       int64_t nowNs = ng2::video::DisplayClockNow();
       if (refilling && !drained) {
         refilling = false;  // (it filled: the acquires block again)
@@ -513,8 +536,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           }
         }
       }
-      if (now - last > std::max(interval * 4, frequency / 20)) {
-        last = now - interval;  // far behind (a stall over 50 ms): no burst
+      const uint64_t maxBehind = can120 ? interval * 2 : std::max(interval * 4, frequency / 20);
+      if (now - last > maxBehind) {
+        last = now - interval;  // far behind (a stall): no catch-up burst
       }
       if (now - last >= interval) {
         last += interval;

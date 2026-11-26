@@ -19,6 +19,7 @@ bool Base720p();  // base_resolution.cpp
 #include "../movie/movie.h"
 #include "prompts.h"
 #include "win_display.h"
+#include "../high_fps/high_fps.h"
 
 #include <atomic>
 #include <bit>
@@ -183,8 +184,10 @@ uint64_t PicturesPresented() {
   return g_picturesPresented.load(std::memory_order_relaxed);
 }
 bool InterpolationOn() {
-  return InterpEnabled();
+  return InterpEnabled() || ng2::high_fps::IsActive();
 }
+
+extern std::atomic<double> g_displayModeHz;
 
 namespace {
 
@@ -195,7 +198,7 @@ namespace {
 // on at once (the game, the build, the GPU), each within a frame.
 constexpr size_t NUM_FRAMES = 3;
 uint32_t FrameSlots() {
-  return InterpEnabled() ? 3u : 2u;
+  return (InterpEnabled() || ng2::high_fps::Enabled()) ? 3u : 2u;
 }
 constexpr RenderFormat BACKBUFFER_FORMAT = RenderFormat::B8G8R8A8_UNORM;
 // Bindless heaps, laid out as the translated shaders expect (docs/shaders.md).
@@ -1017,6 +1020,19 @@ struct FrameRange {
 // Ranges drawn with this frame, each once.
 std::vector<FrameRange> g_frameRanges;
 
+// Per-pass Vertex Fetch Slot 94 snapshots captured at OnSwap on the render
+// thread before subsequent sub-frame passes overwrite 0x83C105D8[slot] in place.
+struct BoneSpan {
+  uint32_t address = 0;
+  uint32_t size = 0;
+};
+struct ReplayBoneSpan {
+  uint32_t address = 0;
+  uint32_t size = 0;
+  const uint8_t* data = nullptr;
+};
+const std::vector<ReplayBoneSpan>* g_swapBoneSpans = nullptr;
+
 // Per-frame upload memory for constants and copies.
 constexpr uint64_t UPLOAD_CHUNK_SIZE = 32ull << 20;
 struct UploadChunk {
@@ -1121,6 +1137,7 @@ uint32_t RenderScaleHalves() {
 // frame's fence has passed.
 std::vector<std::unique_ptr<HostTexture>> g_garbage[NUM_FRAMES];
 uint64_t g_frameCount = 0;
+uint64_t g_logicFrameCount = 0;
 // Render scale: render targets and the textures resolved from them have this
 // many host pixels per guest pixel each way (render_scale, applied between
 // frames by ApplyRenderScale).
@@ -1460,6 +1477,9 @@ bool TestNoBorder() {
 // to a frame of latency while it happens. The last part of the wait spins
 // (Windows' sleeps are whole milliseconds).
 void EvenOutPresent() {
+  if (ng2::high_fps::IsVfrActive()) {
+    return;
+  }
   static const bool on = !TestSwitch("NG2_TEST_EVEN_PRESENT", "0");
   // (with V-Sync on: FIFO, Mailbox or Adaptive; off, the game runs uncapped
   // and this would cap it near the refresh rate)
@@ -1468,11 +1488,12 @@ void EvenOutPresent() {
     return;
   }
   static int64_t last = 0;
-  int64_t refresh = 0, period = 16'666'667;
+  const int64_t targetPeriodNs = ng2::high_fps::IsActive() ? 8'333'333 : 16'666'667;
+  int64_t refresh = 0, period = targetPeriodNs;
   int64_t measured = 0;
   if (DisplayRefresh(&refresh, &measured) && measured > 4'000'000 && measured < 50'000'000) {
-    // (a frame's: the whole refreshes nearest 60 Hz, 2 on a 120 Hz panel)
-    period = measured * std::clamp<int64_t>((16'666'667 + measured / 2) / measured, 1, 4);
+    // (a frame's: the whole refreshes nearest the target rate, 2 at 60 Hz on a 120 Hz panel)
+    period = measured * std::clamp<int64_t>((targetPeriodNs + measured / 2) / measured, 1, 4);
   }
   int64_t now = SteadyNs();
   int64_t until = last + period * 9 / 10;
@@ -1490,6 +1511,39 @@ void EvenOutPresent() {
     }
   }
   last = SteadyNs();
+}
+
+void PaceVfrPresent() {
+  const double capFps = ng2::high_fps::EffectiveVfrFpsLimit();
+  static int64_t nextNs = 0;
+  static int64_t lastPeriodNs = 0;
+  if (capFps <= 0.0) {
+    nextNs = 0;
+    lastPeriodNs = 0;
+    return;
+  }
+  const int64_t targetPeriodNs = std::max<int64_t>(1'000'000, int64_t(1e9 / capFps + 0.5));
+  if (targetPeriodNs != lastPeriodNs) {
+    nextNs = 0;
+    lastPeriodNs = targetPeriodNs;
+  }
+  const int64_t now = SteadyNs();
+  if (nextNs == 0 || now - nextNs > targetPeriodNs * 2) {
+    nextNs = now;
+  }
+  const int64_t waitNs = nextNs - now;
+  if (waitNs > 0) {
+    constexpr int64_t kSpinNs = 300'000;
+    if (waitNs > kSpinNs && PreciseSleepAvailable()) {
+      PreciseSleepNs(waitNs - kSpinNs);
+    } else if (waitNs > 1'500'000) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(waitNs - 1'500'000));
+    }
+    while (SteadyNs() < nextNs) {
+      std::this_thread::yield();
+    }
+  }
+  nextNs += targetPeriodNs;
 }
 
 // Host format for a resolve destination (a guest texture written by the GPU).
@@ -2747,7 +2801,8 @@ int ExclusiveMode() {
   if (forced && forced[0]) {
     return std::clamp(std::atoi(forced), 0, 2);
   }
-  return InterpEnabled() && rex::cvar::Query<bool>("fullscreen") &&
+  return (InterpEnabled() || ng2::high_fps::IsActive()) &&
+                 rex::cvar::Query<bool>("fullscreen") &&
                  rex::cvar::Query<bool>("exclusive_fullscreen")
              ? 1
              : 0;
@@ -2769,9 +2824,33 @@ bool UpdateExclusiveMode() {
   return true;
 }
 
+uint32_t g_lastFrameSlots = 0;
+
+void SyncFrameSlots() {
+  uint32_t slots = FrameSlots();
+  if (g_lastFrameSlots == 0) {
+    g_lastFrameSlots = slots;
+    return;
+  }
+  if (slots == g_lastFrameSlots) {
+    return;
+  }
+  WaitForGPU();
+  if (slots < g_lastFrameSlots) {
+    for (uint32_t s = slots; s < NUM_FRAMES; s++) {
+      ReclaimSlot(s);
+    }
+    if (g_frame >= slots) {
+      g_frame = 0;
+    }
+  }
+  g_lastFrameSlots = slots;
+}
+
 RenderCommandList* CommandList() {
   if (!g_recording) {
     SwitchInterp();
+    SyncFrameSlots();
     if (UpdateExclusiveMode()) {
       g_resizeRequested = true;  // (Borderless from Fullscreen: no resize of its own)
     }
@@ -3053,7 +3132,7 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
   memory.size = uint32_t(std::min<uint64_t>(uint64_t(width) * height * RenderFormatSize(format),
                                             GUEST_MEMORY_SIZE - address));
   memory.hash = ResolvedMemoryHash(address, memory.size);
-  memory.checkedFrame = g_frameCount;
+  memory.checkedFrame = g_logicFrameCount;
   memory.stale = false;
   return slot.get();
 }
@@ -3087,8 +3166,8 @@ bool ResolveCurrent(uint32_t address) {
     return true;
   }
   auto& memory = it->second;
-  if (!memory.stale && memory.checkedFrame != g_frameCount) {
-    memory.checkedFrame = g_frameCount;
+  if (!memory.stale && memory.checkedFrame != g_logicFrameCount) {
+    memory.checkedFrame = g_logicFrameCount;
     memory.stale = ResolvedMemoryHash(address, memory.size) != memory.hash;
     if (memory.stale && Tracing()) {
       TraceLog("video: resolve memory {:#x} overwritten", address);
@@ -3452,26 +3531,26 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   // frames (static geometry; comparing it all twice a frame was most of this
   // stage). A rewrite after that shows up to that many frames late.
   if (!always && !first && !range.dynamic &&
-      g_frameCount - range.changedFrame > kRangeStableFrames &&
-      g_frameCount - range.checkedFrame < kRangeRecheckFrames) {
+      g_logicFrameCount - range.changedFrame > kRangeStableFrames &&
+      g_logicFrameCount - range.checkedFrame < kRangeRecheckFrames) {
     return;
   }
-  if (!always && range.checkedFrame != g_frameCount) {
+  if (!always && range.checkedFrame != g_logicFrameCount) {
     g_frameRanges.push_back({address, size, &range, nullptr});
   }
   // Unchanged for a while (memory reused, a buffer patched once): back to once a frame.
-  if (range.dynamic && range.changedFrame + 8 < g_frameCount) {
+  if (range.dynamic && range.changedFrame + 8 < g_logicFrameCount) {
     range.dynamic = false;
   }
-  bool stable = !first && !range.dynamic && range.changedFrame + 1 < g_frameCount;
-  if (!always && stable && range.checkedFrame == g_frameCount) {
+  bool stable = !first && !range.dynamic && range.changedFrame + 1 < g_logicFrameCount;
+  if (!always && stable && range.checkedFrame == g_logicFrameCount) {
     return;
   }
-  range.checkedFrame = g_frameCount;
+  range.checkedFrame = g_logicFrameCount;
   const uint8_t* source = guest::Physical(address);
   uint8_t* shadow = g_guestMemoryShadow + address;
   g_profile.comparedBytes += size;
-  if (!first && g_frameCount - range.changedFrame > 60) {
+  if (!first && g_logicFrameCount - range.changedFrame > 60) {
     g_profile.quietBytes += size;
   }
   // Upload only the span between the first and last block that differ.
@@ -3499,7 +3578,7 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     return;
   }
   uint32_t length = end - begin;
-  range.changedFrame = g_frameCount;
+  range.changedFrame = g_logicFrameCount;
   g_profile.uploadedBytes += length;
   std::memcpy(shadow + begin, source + begin, length);
   Upload upload = AllocateCopySource(length, 16);
@@ -3523,7 +3602,7 @@ void FinishGuestMemory() {
     // the game starts writing after its draws is still copied at its next
     // draw, which marks it changed and so looked at here every frame again:
     // found late a few frames later than before.
-    if (!frameRange.lateCopy && g_frameCount - range.changedFrame > 60 &&
+    if (!frameRange.lateCopy && g_logicFrameCount - range.changedFrame > 60 &&
         (range.finishTurn++ + (frameRange.address * 0x9E3779B1u >> 29)) % 8 != 0) {
       continue;
     }
@@ -3535,7 +3614,7 @@ void FinishGuestMemory() {
                     g_guestMemoryShadow + frameRange.address, frameRange.size) == 0) {
       continue;
     }
-    if (range.changedFrame + 1 >= g_frameCount) {
+    if (range.changedFrame + 1 >= g_logicFrameCount) {
       // Checked at every draw this frame and still written after the last.
       range.late = true;
       REXLOG_DEBUG("video: {:#x} ({} bytes) is written after its draws", frameRange.address,
@@ -3543,13 +3622,26 @@ void FinishGuestMemory() {
     } else {
       // Checked once this frame: it may be filled between two of its draws, so from now on
       // check it at every draw.
-      range.changedFrame = g_frameCount;
+      range.changedFrame = g_logicFrameCount;
       range.dynamic = true;
     }
   }
   for (auto& frameRange : g_frameRanges) {
     if (frameRange.lateCopy) {
-      const uint8_t* source = guest::Physical(frameRange.address);
+      const uint8_t* source = nullptr;
+      if (g_swapBoneSpans) {
+        for (const auto& span : *g_swapBoneSpans) {
+          if (frameRange.address >= span.address &&
+              uint64_t(frameRange.address) + frameRange.size <=
+                  uint64_t(span.address) + span.size) {
+            source = span.data + (frameRange.address - span.address);
+            break;
+          }
+        }
+      }
+      if (!source) {
+        source = guest::Physical(frameRange.address);
+      }
       std::memcpy(frameRange.lateCopy, source, frameRange.size);
       std::memcpy(g_guestMemoryShadow + frameRange.address, source, frameRange.size);
       g_profile.uploadedBytes += frameRange.size;
@@ -4420,12 +4512,12 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   bool promptTexture = cached.host && cached.host->prompts;
   header |= promptTexture;
   bool stable = cached.host && !header && cached.checkedFrame != ~0ull &&
-                g_frameCount - cached.changedFrame > kTextureStableFrames;
-  bool due = stable ? g_frameCount - cached.checkedFrame >= kTextureRecheckFrames
-                    : cached.checkedFrame != g_frameCount;
+                g_logicFrameCount - cached.changedFrame > kTextureStableFrames;
+  bool due = stable ? g_logicFrameCount - cached.checkedFrame >= kTextureRecheckFrames
+                    : cached.checkedFrame != g_logicFrameCount;
   g_profile.textureLookups++;
   if (due) {
-    cached.checkedFrame = g_frameCount;
+    cached.checkedFrame = g_logicFrameCount;
     g_profile.hashedBytes += guestSize + layout.mipsSize;
     const uint8_t* data = guest::Physical(base);
     const uint8_t* mipData = guest::Physical(layout.mipAddress);
@@ -4439,14 +4531,14 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
       // (once a frame, so the atlas and its palette are made for the same set)
       static uint64_t generationFrame = ~0ull;
       static uint32_t generation = 0;
-      if (generationFrame != g_frameCount) {
-        generationFrame = g_frameCount;
+      if (generationFrame != g_logicFrameCount) {
+        generationFrame = g_logicFrameCount;
         generation = prompts::Generation();
       }
       hash += uint64_t(generation) * 0x9E3779B97F4A7C15ull;
     }
     if (hash != cached.contentHash || (!cached.host && cached.contentHash == 0)) {
-      cached.changedFrame = g_frameCount;
+      cached.changedFrame = g_logicFrameCount;
       if (cached.host) {
         g_garbage[g_frame].push_back(std::move(cached.host));
       }
@@ -4494,7 +4586,7 @@ uint64_t g_frameTexturesFrame = ~0ull;
 
 void ForgetFrameTextures(uint32_t base) {
   auto it = g_frameTexturesByBase.find(base);
-  if (it == g_frameTexturesByBase.end() || it->second.frame != g_frameCount) {
+  if (it == g_frameTexturesByBase.end() || it->second.frame != g_logicFrameCount) {
     return;
   }
   for (const FetchKey& key : it->second.keys) {
@@ -4505,8 +4597,8 @@ void ForgetFrameTextures(uint32_t base) {
 
 uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   StageTimer timer(Stage::kTexture);
-  if (g_frameTexturesFrame != g_frameCount) {
-    g_frameTexturesFrame = g_frameCount;
+  if (g_frameTexturesFrame != g_logicFrameCount) {
+    g_frameTexturesFrame = g_logicFrameCount;
     g_frameTextures.clear();
   }
   FetchKey key;
@@ -4515,8 +4607,8 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   if (inserted) {
     it->second = LookUpTexture(fetch);
     FrameTextureKeys& byBase = g_frameTexturesByBase[uint32_t(fetch.base_address) << 12];
-    if (byBase.frame != g_frameCount) {
-      byBase.frame = g_frameCount;
+    if (byBase.frame != g_logicFrameCount) {
+      byBase.frame = g_logicFrameCount;
       byBase.keys.clear();
     }
     byBase.keys.push_back(key);
@@ -5280,6 +5372,7 @@ void SwitchInterp() {
   g_swapChainFramebuffers.clear();
   g_swapChainValid = g_swapChain->resize();
   SetInterpPictureCap();
+  g_lastFrameSlots = FrameSlots();
   REXLOG_INFO("video: frame interpolation {} ({} swapchain images)", wanted ? "on" : "off",
               g_swapChain->getTextureCount());
 }
@@ -6495,9 +6588,9 @@ void WriteInterpShots() {
   g_interpShots.clear();
 }
 
-void Present(HostTexture* frontBuffer) {
+void Present(HostTexture* frontBuffer, bool isFirstPass) {
   StageTimer timer(Stage::kPresent);
-  {
+  if (isFirstPass) {
     static uint32_t lastTicks = 0;
     uint32_t ticks = guest::Load32(0x84C55B50);
     if (lastTicks) {
@@ -6733,9 +6826,18 @@ void Present(HostTexture* frontBuffer) {
       static auto relaxedUntil = std::chrono::steady_clock::time_point{};
       static auto returnedAt = std::chrono::steady_clock::time_point{};
       static std::chrono::seconds hold{5};
+      const bool vfr = ng2::high_fps::IsVfrActive();
       auto now = std::chrono::steady_clock::now();
       int repeating = g_repeatsLastSecond.load();
-      if (adapt && repeating >= 3) {
+      if (vfr) {
+        // VRR frame-time variation is normal in VFR; do not misinterpret it as
+        // fixed-refresh frame repeats and degrade Low to maxFrameLatency(2).
+        if (relaxed) {
+          relaxed = false;
+          returnedAt = now;
+          g_swapChain->setMaxFrameLatency(1);
+        }
+      } else if (adapt && repeating >= 3) {
         if (!relaxed) {
           relaxed = true;
           bool soon = returnedAt != std::chrono::steady_clock::time_point{} &&
@@ -6757,20 +6859,26 @@ void Present(HostTexture* frontBuffer) {
           REXLOG_INFO("video: Input Latency Low: frames no longer repeat, no frame queued again");
         }
       }
-      auto start = std::chrono::steady_clock::now();
-      g_swapChain->wait();
-      bool timedOut = std::chrono::steady_clock::now() - start > std::chrono::milliseconds(90);
-      timeouts = timedOut ? timeouts + 1 : 0;
-      if (timeouts == 3) {
-        static bool logged = false;
-        if (!logged) {
-          logged = true;
-          REXLOG_WARN("video: the waits for the screen time out (a hidden window?): Input Latency Low "
-                      "paused for 5 s at a time while they do");
+      if (!(vfr && mode == 0)) {
+        auto start = std::chrono::steady_clock::now();
+        g_swapChain->wait();
+        bool timedOut = std::chrono::steady_clock::now() - start > std::chrono::milliseconds(90);
+        timeouts = timedOut ? timeouts + 1 : 0;
+        if (timeouts == 3) {
+          static bool logged = false;
+          if (!logged) {
+            logged = true;
+            REXLOG_WARN("video: the waits for the screen time out (a hidden window?): Input Latency Low "
+                        "paused for 5 s at a time while they do");
+          }
+          timeouts = 0;
+          pausedUntil = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         }
-        timeouts = 0;
-        pausedUntil = std::chrono::steady_clock::now() + std::chrono::seconds(5);
       }
+    }
+
+    if (ng2::high_fps::IsVfrActive()) {
+      PaceVfrPresent();
     }
 
     // The frame's picture into a swapchain image: index and the semaphore
@@ -7139,7 +7247,9 @@ void Present(HostTexture* frontBuffer) {
         if (InterpEnabled()) {
           g_presenter.WaitFor(0);
         }
-        EvenOutPresent();
+        if (!ng2::high_fps::IsVfrActive()) {
+          EvenOutPresent();
+        }
         int64_t presentStart = SteadyNs();
         g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
         if (g_swapChainValid) {
@@ -7233,6 +7343,7 @@ void ReadModeRefresh(SDL_Window* window) {
   int64_t refresh = 0;
   if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window))) {
     if (mode->refresh_rate > 20.0f) {
+      g_displayModeHz.store(double(mode->refresh_rate), std::memory_order_relaxed);
       refresh = int64_t(1e9 / double(mode->refresh_rate));
       static std::atomic<int64_t> logged{0};
       if (logged.exchange(refresh) != refresh) {
@@ -7510,16 +7621,22 @@ void DisplayClockThread() {
   // gaps rounded to 60 Hz units read 61 Hz on a 120 Hz laptop panel, and Auto
   // never locked). 144-170 Hz, which 60 doesn't divide, stays at 1, as before.
   int every = 1;
+  double lastTargetHz = 60.0;
   while (g_displayRun.load()) {
     // (the rate is asked for from the presents, every 5 s: see Present)
-    if (double hz = g_displayModeHz.load(); hz > 0) {
-      int n = std::clamp(int(hz / 60.0 + 0.5), 1, 4);
-      if (n > 1 && std::abs(hz / n - 60.0) > 1.2) {
+    const bool vfr = ng2::high_fps::IsVfrActive();
+    double hz = g_displayModeHz.load();
+    const double targetHz = vfr ? (hz > 0.0 ? hz : 60.0)
+                                : (ng2::high_fps::IsActive() ? 120.0 : 60.0);
+    if (hz > 0) {
+      int n = std::clamp(int(hz / targetHz + 0.5), 1, 4);
+      if (n > 1 && std::abs(hz / n - targetHz) > 1.2 * (targetHz / 60.0)) {
         n = 1;
       }
-      if (n != every) {
+      if (n != every || targetHz != lastTargetHz) {
         every = n;
-        period = 1e9 / (60.0 * every);
+        lastTargetHz = targetHz;
+        period = 1e9 / (targetHz * every);
         last = 0;  // (measured afresh, below)
         REXLOG_INFO("video: display clock counts {} refreshes a frame ({:.2f} Hz display)", every, hz);
       }
@@ -7696,6 +7813,10 @@ int64_t InterpRefreshNs() {
 
 int64_t ModeRefreshNs() {
   return g_modeRefreshNs.load();
+}
+
+double DisplayModeHz() {
+  return g_displayModeHz.load(std::memory_order_relaxed);
 }
 
 InterpUpload AllocateInterpUpload(uint32_t slot, uint64_t size, uint64_t alignment) {
@@ -8365,6 +8486,7 @@ void ApplyResolveReadbacks(uint32_t frame) {
 
 void DestroyHostDevice() {
   g_presentDrainCheck.store(false);
+  g_lastFrameSlots = 0;
   StopDrawWorker();
   if (g_displayThread) {
     g_displayRun.store(false);
@@ -8909,7 +9031,7 @@ void ApplyRenderScale() {
               ScaleOf(finalScale));
 }
 
-void RunSwap(uint32_t device, uint32_t frontBuffer) {
+void RunSwap(uint32_t device, uint32_t frontBuffer, bool isFirstPass) {
   std::lock_guard lock(g_mutex);
   if (!g_device) {
     return;
@@ -8934,7 +9056,7 @@ void RunSwap(uint32_t device, uint32_t frontBuffer) {
                   front ? "found" : "not resolved");
     }
   }
-  Present(front);
+  Present(front, isFirstPass);
   ApplyRenderScale();
   ReportProfile();
 }
@@ -8977,11 +9099,18 @@ constexpr uint32_t kMirrorDeclaration = 0x4200, kDeclarationMax = 52 + 64 * 12;
 constexpr uint32_t kSurfaceFields = 0x3090, kSurfaceCount = 5, kSurfaceBytes = 48;
 constexpr uint32_t kMirrorSurfaces = 0x4600;
 constexpr uint32_t kMirrorSize = 0x4800;
-// Immediate-mode data (HUD-sized), a half for each frame, from the game's
-// physical memory (the drawing takes its physical address).
-constexpr uint32_t kStagingHalf = 2u << 20;
+// Immediate-mode data (HUD-sized): segmented guest physical staging pools (two
+// halves toggled at Swap) that grow on demand so large immediate-mode draws
+// (> 2 MB) are never dropped and same-frame draws never wrap over each other.
+constexpr uint32_t kInitialStagingChunk = 2u << 20;
 
-enum class Rec : uint32_t { kDraw, kInline, kClear, kResolve, kSwap };
+struct StagingChunk {
+  uint32_t address = 0;
+  uint32_t capacity = 0;
+  uint32_t used = 0;
+};
+
+enum class Rec : uint32_t { kDraw, kInline, kClear, kResolve, kSwap, kLogicFrame };
 struct RecHeader {
   Rec type;
   uint32_t bytes;  // the whole record, this header and the delta included
@@ -9007,6 +9136,7 @@ struct ResolveArgs {
 };
 struct SwapArgs {
   uint32_t frontBuffer;
+  uint8_t isFirstPass;
   uint8_t format[4];
   uint8_t gamma[kGammaBytes];
   uint8_t frontHeader[kTextureBytes];
@@ -9032,6 +9162,16 @@ struct DrawWorker {
   std::vector<uint8_t> record;
   uint8_t shadow[kWindowEnd] = {};
   uint32_t device = 0;
+  bool surfaceValid = false;
+  uint8_t surfaceShadowPresent = 0;
+  uint8_t surfaceShadow[kSurfaceCount][kSurfaceBytes] = {};
+  bool ibValid = false, ibPresent = false;
+  uint8_t ibShadow[kIndexBufferBytes] = {};
+  bool declValid = false;
+  uint32_t declBytes = 0;
+  uint8_t declShadow[kDeclarationMax] = {};
+  std::vector<BoneSpan> boneSpans;
+  uint32_t lastBoneWord0 = 0, lastBoneWord1 = 0;
   // An immediate-mode draw: its record (the device as at its call) waits for
   // its data, which the game writes after the call.
   struct {
@@ -9042,8 +9182,14 @@ struct DrawWorker {
   } inl;
   bool failed = false;  // (producer) no guest memory: the calls run at once
 
-  // The worker's side: guest memory for the mirror and the staging.
-  uint32_t mirror = 0, staging = 0, stagingUsed = 0, stagingHalf = 0;
+  // The worker's side: guest memory for the mirror and dynamic staging pools.
+  uint32_t mirror = 0;
+  std::vector<StagingChunk> stagingHalves[2];
+  uint32_t stagingHalf = 0;
+  size_t stagingChunkIdx = 0;
+  int64_t passStartNs = 0;
+  std::atomic<int64_t> avgSwapWorkNs{0};
+  std::vector<ReplayBoneSpan> replayBoneSpans;
 
 };
 // Never destroyed: an exit without DestroyHostDevice leaves the thread running
@@ -9051,11 +9197,17 @@ struct DrawWorker {
 DrawWorker& g_worker = *new DrawWorker;
 
 bool DrawWorkerEnabled() {
-  static const bool on = [] {
+  static const int overrideMode = [] {
     const char* v = std::getenv("NG2_DRAW_WORKER");
-    return v && v[0] == '1';
+    if (!v || !v[0]) {
+      return -1;
+    }
+    return v[0] == '1' ? 1 : 0;
   }();
-  return on;
+  if (overrideMode >= 0) {
+    return overrideMode != 0;
+  }
+  return ng2::high_fps::Enabled();
 }
 
 uint32_t AllocGuest(uint32_t size) {
@@ -9082,6 +9234,27 @@ void Put(const T& value) {
   Put(&value, sizeof(value));
 }
 
+inline bool BlockEqual64(const uint8_t* a, const uint8_t* b) {
+#if defined(__AVX2__)
+  const __m256i x0 = _mm256_xor_si256(
+      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a)),
+      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b)));
+  const __m256i x1 = _mm256_xor_si256(
+      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32)),
+      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 32)));
+  return _mm256_testz_si256(_mm256_or_si256(x0, x1), _mm256_or_si256(x0, x1)) != 0;
+#else
+  uint64_t diff = 0;
+  for (uint32_t i = 0; i < 8; i++) {
+    uint64_t va, vb;
+    std::memcpy(&va, a + i * 8, 8);
+    std::memcpy(&vb, b + i * 8, 8);
+    diff |= (va ^ vb);
+  }
+  return diff == 0;
+#endif
+}
+
 // Starts a record: its header, then the device's changed blocks.
 void BeginRecord(Rec type, uint32_t device) {
   auto& w = g_worker;
@@ -9091,13 +9264,16 @@ void BeginRecord(Rec type, uint32_t device) {
     w.device = device;
     std::memset(w.shadow, 0xA5, sizeof(w.shadow));  // all blocks sent again
     w.shadow[kWindowBegin] ^= 0xFF;
+    w.surfaceValid = false;
+    w.ibValid = false;
+    w.declValid = false;
   }
   size_t countAt = w.record.size();
   Put(uint32_t(0));
   uint32_t count = 0;
   const uint8_t* dev = guest::Virtual(device);
   for (uint32_t off = kWindowBegin; off < kWindowEnd; off += kBlock) {
-    if (std::memcmp(dev + off, w.shadow + off, kBlock) == 0) {
+    if (BlockEqual64(dev + off, w.shadow + off)) {
       continue;
     }
     std::memcpy(w.shadow + off, dev + off, kBlock);
@@ -9109,38 +9285,82 @@ void BeginRecord(Rec type, uint32_t device) {
 }
 
 // The surfaces' objects, after the delta of draws, clears and resolves.
+// Encodes a 5-bit present mask, a 5-bit changed mask, and only changed
+// surface headers (PointAt still runs for every active slot on Replay).
 void PutSurfaces(uint32_t device) {
+  auto& w = g_worker;
+  uint8_t presentMask = 0;
+  uint8_t changedMask = 0;
+  uint8_t objects[kSurfaceCount][kSurfaceBytes];
   for (uint32_t i = 0; i < kSurfaceCount; i++) {
-    uint8_t object[kSurfaceBytes] = {};
     uint32_t surface = guest::Load32(device + kSurfaceFields + i * 4);
     if (surface) {
-      std::memcpy(object, guest::Virtual(surface), sizeof(object));
+      presentMask |= uint8_t(1u << i);
+      std::memcpy(objects[i], guest::Virtual(surface), kSurfaceBytes);
+      if (!w.surfaceValid || !(w.surfaceShadowPresent & (1u << i)) ||
+          std::memcmp(objects[i], w.surfaceShadow[i], kSurfaceBytes) != 0) {
+        changedMask |= uint8_t(1u << i);
+        std::memcpy(w.surfaceShadow[i], objects[i], kSurfaceBytes);
+      }
     }
-    Put(uint32_t(surface != 0));
-    Put(object, sizeof(object));
+  }
+  w.surfaceShadowPresent = presentMask;
+  w.surfaceValid = true;
+  Put(presentMask);
+  Put(changedMask);
+  for (uint32_t i = 0; i < kSurfaceCount; i++) {
+    if (changedMask & (1u << i)) {
+      Put(objects[i], kSurfaceBytes);
+    }
   }
 }
 
 void DrawWorkerThread();
+void FlushInline();
+void WaitForWorker(uint64_t records);
 
 // The worker is used (under the producer lock): started on first use; without
-// its guest memory the calls run at once.
+// its guest memory the calls run at once. If disabled at runtime after being
+// started, drains all pending records first so direct execution stays in order.
 bool Recording() {
   auto& w = g_worker;
   if (!DrawWorkerEnabled() || w.failed) {
+    if (w.started.load(std::memory_order_acquire)) {
+      if (w.inl.pending && w.inl.thread == std::this_thread::get_id()) {
+        FlushInline();
+      }
+      uint64_t pending = w.queued.load(std::memory_order_acquire);
+      if (pending) {
+        WaitForWorker(pending);
+      }
+      w.device = 0;  // re-send full device shadow if re-enabled later
+    }
+    w.surfaceValid = false;
+    w.ibValid = false;
+    w.declValid = false;
+    w.boneSpans.clear();
+    w.lastBoneWord0 = 0;
+    w.lastBoneWord1 = 0;
+    w.avgSwapWorkNs.store(0, std::memory_order_relaxed);
     return false;
   }
-  if (!w.started) {
+  if (!w.started.load(std::memory_order_acquire)) {
     // The mirror is only read through virtual addresses: the system heap.
     w.mirror = rex::Runtime::instance()->memory()->SystemHeapAlloc(kMirrorSize, 4096);
-    w.staging = AllocGuest(kStagingHalf * 2);
-    if (!w.mirror || !w.staging) {
+    uint32_t half0 = AllocGuest(kInitialStagingChunk);
+    uint32_t half1 = half0 ? AllocGuest(kInitialStagingChunk) : 0;
+    if (!w.mirror || !half0 || !half1) {
       REXLOG_WARN("video: draw worker: no guest memory for it, the calls run at once");
       w.failed = true;
       return false;
     }
-    REXLOG_INFO("video: draw worker on (mirror {:#x}, staging {:#x})", w.mirror, w.staging);
-    w.started = true;
+    w.stagingHalves[0].push_back({half0, kInitialStagingChunk, 0});
+    w.stagingHalves[1].push_back({half1, kInitialStagingChunk, 0});
+    w.stagingHalf = 0;
+    w.stagingChunkIdx = 0;
+    REXLOG_INFO("video: draw worker on (mirror {:#x}, staging {:#x}/{:#x}, {} MB/half initial)",
+                w.mirror, half0, half1, kInitialStagingChunk >> 20);
+    w.started.store(true, std::memory_order_release);
     w.thread = std::thread(DrawWorkerThread);
   }
   return true;
@@ -9180,30 +9400,94 @@ void FlushInline() {
 }
 
 // A draw's copies: the index buffer's header, the vertex declaration.
+// Uses bit 0 = present, bit 1 = payload changed to avoid resending identical
+// headers on every draw call.
 void PutDrawCopies(uint32_t device, bool indexed) {
+  auto& w = g_worker;
   if (indexed) {
     uint32_t ib = guest::Load32(device + kIndexBufferField);
+    uint8_t ibFlags = ib ? 1u : 0u;
     uint8_t header[kIndexBufferBytes] = {};
     if (ib) {
       std::memcpy(header, guest::Virtual(ib), sizeof(header));
+      if (!w.ibValid || !w.ibPresent ||
+          std::memcmp(header, w.ibShadow, sizeof(header)) != 0) {
+        ibFlags |= 2u;
+        std::memcpy(w.ibShadow, header, sizeof(header));
+      }
     }
-    Put(header, sizeof(header));
+    w.ibPresent = (ib != 0);
+    w.ibValid = true;
+    Put(ibFlags);
+    if (ibFlags & 2u) {
+      Put(header, sizeof(header));
+    }
   }
   uint32_t declaration = guest::Load32(device + kDeclarationField);
   uint32_t bytes = 0;
   if (declaration) {
     bytes = std::min(52 + std::min(guest::Load32(declaration + 24), 64u) * 12, kDeclarationMax);
   }
-  Put(bytes);
+  uint8_t declFlags = bytes ? 1u : 0u;
+  const uint8_t* declPtr = bytes ? guest::Virtual(declaration) : nullptr;
   if (bytes) {
-    Put(guest::Virtual(declaration), bytes);
+    if (!w.declValid || w.declBytes != bytes ||
+        std::memcmp(declPtr, w.declShadow, bytes) != 0) {
+      declFlags |= 2u;
+      std::memcpy(w.declShadow, declPtr, bytes);
+      w.declBytes = bytes;
+    }
+  } else {
+    w.declBytes = 0;
   }
+  w.declValid = true;
+  Put(declFlags);
+  if (declFlags & 2u) {
+    Put(bytes);
+    Put(declPtr, bytes);
+  }
+}
+
+// Records Vertex Fetch Slot 94's bound physical range on the producer thread
+// so OnSwap can snapshot bone palettes before concurrent sub-frame writes.
+void NoteBonePaletteFetch(uint32_t device) {
+  auto& w = g_worker;
+  uint32_t word0 = guest::Load32(device + 0x480 + 94 * 8);
+  uint32_t word1 = guest::Load32(device + 0x480 + 94 * 8 + 4);
+  if (word0 == w.lastBoneWord0 && word1 == w.lastBoneWord1) {
+    return;
+  }
+  w.lastBoneWord0 = word0;
+  w.lastBoneWord1 = word1;
+  if ((word0 & 3u) != uint32_t(xenos::FetchConstantType::kVertex)) {
+    return;
+  }
+  uint32_t address = (word0 & 0xFFFFFFFCu) & 0x1FFFFFFFu;
+  uint32_t size = word1 & 0x3FFFFFCu;
+  if (!size || size > (16u << 20) || uint64_t(address) + size > GUEST_MEMORY_SIZE) {
+    return;
+  }
+  uint32_t end = address + size;
+  for (auto it = w.boneSpans.begin(); it != w.boneSpans.end();) {
+    if (address >= it->address && end <= it->address + it->size) {
+      return;
+    }
+    if (address <= it->address + it->size && it->address <= end) {
+      address = std::min(address, it->address);
+      end = std::max(end, it->address + it->size);
+      it = w.boneSpans.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  w.boneSpans.push_back({address, end - address});
 }
 
 // Records an immediate-mode draw's call (the device now), sent with its data.
 void BeginInline(uint32_t device, const InlineArgs& args, uint32_t vertexData,
                  uint32_t indexData) {
   auto& w = g_worker;
+  NoteBonePaletteFetch(device);
   BeginRecord(Rec::kInline, device);
   PutSurfaces(device);
   Put(args);
@@ -9233,26 +9517,62 @@ void WaitForWorker(uint64_t records) {
   });
 }
 
-// The worker's copy of immediate-mode data, in guest memory.
+// The worker's copy of immediate-mode data, in guest physical memory.
+// Grows the active half's segmented chunk list on demand so large draws
+// (> 2 MB) or heavy frames never drop or overwrite earlier same-frame data.
 uint32_t Stage(const uint8_t* data, uint32_t bytes) {
   auto& w = g_worker;
-  uint32_t size = (bytes + 255) & ~255u;
-  if (!w.staging || size > kStagingHalf) {
+  uint32_t size = (bytes + 255u) & ~255u;
+  if (size == 0) {
+    size = 256u;
+  }
+  auto& chunks = w.stagingHalves[w.stagingHalf];
+  if (chunks.empty()) {
     return 0;
   }
-  if (w.stagingUsed + size > kStagingHalf) {
-    static bool logged = false;
-    if (!logged) {
-      logged = true;
-      REXLOG_WARN("video: draw worker: more than {} MB of immediate-mode data in a frame",
-                  kStagingHalf >> 20);
+  // Try the current chunk and any subsequent already-allocated chunks in this half.
+  for (size_t i = w.stagingChunkIdx; i < chunks.size(); i++) {
+    if (chunks[i].used + size <= chunks[i].capacity) {
+      w.stagingChunkIdx = i;
+      uint32_t address = chunks[i].address + chunks[i].used;
+      chunks[i].used += size;
+      std::memcpy(guest::Virtual(address), data, bytes);
+      return address;
     }
-    w.stagingUsed = 0;
   }
-  uint32_t address = w.staging + w.stagingHalf * kStagingHalf + w.stagingUsed;
-  w.stagingUsed += size;
-  std::memcpy(guest::Virtual(address), data, bytes);
-  return address;
+  // Allocate a new segment sized to hold this draw (at least kInitialStagingChunk).
+  uint32_t allocSize = std::max(kInitialStagingChunk, (size + 0xFFFFu) & ~0xFFFFu);
+  uint32_t extra = AllocGuest(allocSize);
+  if (extra) {
+    chunks.push_back({extra, allocSize, size});
+    w.stagingChunkIdx = chunks.size() - 1;
+    uint32_t totalMb = 0;
+    for (const auto& c : chunks) {
+      totalMb += c.capacity;
+    }
+    REXLOG_INFO("video: draw worker: expanded staging half {} by {} KB ({} chunks, {:.1f} MB)",
+                w.stagingHalf, allocSize >> 10, chunks.size(), double(totalMb) / double(1u << 20));
+    std::memcpy(guest::Virtual(extra), data, bytes);
+    return extra;
+  }
+  // Out of guest physical memory: fall back to reusing the first chunk that fits.
+  for (size_t i = 0; i < chunks.size(); i++) {
+    if (size <= chunks[i].capacity) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_WARN("video: draw worker: staging alloc failed ({} KB), wrapping chunk {}",
+                    allocSize >> 10, i);
+      }
+      chunks[i].used = size;
+      w.stagingChunkIdx = i;
+      std::memcpy(guest::Virtual(chunks[i].address), data, bytes);
+      return chunks[i].address;
+    }
+  }
+  REXLOG_WARN("video: draw worker: dropping immediate-mode draw ({} bytes, out of guest memory)",
+              bytes);
+  return 0;
 }
 
 // A record replayed (the steps and the frame limit waiting for it may go).
@@ -9280,22 +9600,27 @@ void PointAt(uint32_t field, uint32_t copy) {
 void ApplyDrawCopies(const uint8_t*& at, bool indexed) {
   uint8_t* m = guest::Virtual(g_worker.mirror);
   if (indexed) {
-    static constexpr uint8_t kNone[kIndexBufferBytes] = {};
-    if (std::memcmp(at, kNone, kIndexBufferBytes) == 0) {
-      std::memset(m + kIndexBufferField, 0, 4);  // none at the call
-    } else {
+    uint8_t ibFlags = *at++;
+    if (ibFlags & 2u) {
       std::memcpy(m + kMirrorIndexBuffer, at, kIndexBufferBytes);
-      PointAt(kIndexBufferField, kMirrorIndexBuffer);
+      at += kIndexBufferBytes;
     }
-    at += kIndexBufferBytes;
+    if (ibFlags & 1u) {
+      PointAt(kIndexBufferField, kMirrorIndexBuffer);
+    } else {
+      std::memset(m + kIndexBufferField, 0, 4);
+    }
   }
-  uint32_t bytes;
-  std::memcpy(&bytes, at, 4);
-  at += 4;
-  if (bytes) {
+  uint8_t declFlags = *at++;
+  if (declFlags & 2u) {
+    uint32_t bytes;
+    std::memcpy(&bytes, at, 4);
+    at += 4;
     std::memcpy(m + kMirrorDeclaration, at, bytes);
-    PointAt(kDeclarationField, kMirrorDeclaration);
     at += bytes;
+  }
+  if (declFlags & 1u) {
+    PointAt(kDeclarationField, kMirrorDeclaration);
   } else {
     std::memset(m + kDeclarationField, 0, 4);
   }
@@ -9305,6 +9630,14 @@ void Replay(const uint8_t* p) {
   auto& w = g_worker;
   RecHeader h;
   std::memcpy(&h, p, sizeof(h));
+  if (h.type == Rec::kLogicFrame) {
+    std::lock_guard lock(g_mutex);
+    g_logicFrameCount++;
+    return;
+  }
+  if (w.passStartNs == 0) {
+    w.passStartNs = SteadyNs();
+  }
   const RecHeader* header = &h;
   const uint8_t* at = p + sizeof(RecHeader);
   uint32_t count;
@@ -9318,17 +9651,19 @@ void Replay(const uint8_t* p) {
     at += 4 + kBlock;
   }
   if (header->type != Rec::kSwap) {
+    uint8_t presentMask = *at++;
+    uint8_t changedMask = *at++;
     for (uint32_t i = 0; i < kSurfaceCount; i++) {
-      uint32_t present;
-      std::memcpy(&present, at, 4);
       uint32_t copy = kMirrorSurfaces + i * kSurfaceBytes;
-      std::memcpy(mirror + copy, at + 4, kSurfaceBytes);
-      if (present) {
+      if (changedMask & (1u << i)) {
+        std::memcpy(mirror + copy, at, kSurfaceBytes);
+        at += kSurfaceBytes;
+      }
+      if (presentMask & (1u << i)) {
         PointAt(kSurfaceFields + i * 4, copy);
       } else {
         std::memset(mirror + kSurfaceFields + i * 4, 0, 4);
       }
-      at += 4 + kSurfaceBytes;
     }
   }
   uint32_t device = w.mirror;
@@ -9386,14 +9721,44 @@ void Replay(const uint8_t* p) {
     case Rec::kSwap: {
       SwapArgs a;
       std::memcpy(&a, at, sizeof(a));
+      at += sizeof(a);
+      uint32_t spanCount = 0;
+      std::memcpy(&spanCount, at, 4);
+      at += 4;
+      w.replayBoneSpans.clear();
+      w.replayBoneSpans.reserve(spanCount);
+      for (uint32_t i = 0; i < spanCount; i++) {
+        ReplayBoneSpan span{};
+        std::memcpy(&span.address, at, 4);
+        std::memcpy(&span.size, at + 4, 4);
+        span.data = at + 8;
+        at += 8 + span.size;
+        w.replayBoneSpans.push_back(span);
+      }
       std::memcpy(mirror + kFrontFormat, a.format, sizeof(a.format));
       std::memcpy(mirror + kGamma, a.gamma, sizeof(a.gamma));
       std::memcpy(mirror + kMirrorTexture, a.frontHeader, sizeof(a.frontHeader));
-      RunSwap(device, a.frontBuffer ? w.mirror + kMirrorTexture : 0);
+      g_swapBoneSpans = w.replayBoneSpans.empty() ? nullptr : &w.replayBoneSpans;
+      RunSwap(device, a.frontBuffer ? w.mirror + kMirrorTexture : 0, a.isFirstPass != 0);
+      g_swapBoneSpans = nullptr;
+      const int64_t doneNs = SteadyNs();
+      const int64_t workNs = w.passStartNs > 0 ? std::max<int64_t>(0, doneNs - w.passStartNs) : 0;
+      w.passStartNs = 0;
+      if (workNs > 0 && workNs < 50'000'000) {
+        const int64_t sampleNs = std::min<int64_t>(workNs, 16'666'667);
+        int64_t prevAvg = w.avgSwapWorkNs.load(std::memory_order_relaxed);
+        int64_t nextAvg = prevAvg <= 0 ? sampleNs : (prevAvg * 3 + sampleNs) / 4;
+        w.avgSwapWorkNs.store(nextAvg, std::memory_order_relaxed);
+      }
       w.stagingHalf ^= 1;
-      w.stagingUsed = 0;
+      for (auto& chunk : w.stagingHalves[w.stagingHalf]) {
+        chunk.used = 0;
+      }
+      w.stagingChunkIdx = 0;
       break;
     }
+    case Rec::kLogicFrame:
+      break;
   }
 }
 
@@ -9444,15 +9809,14 @@ void StopDrawWorker() {
 }
 
 uint64_t RecordedCalls() {
-  if (!DrawWorkerEnabled()) {
-    return 0;
-  }
   auto& w = g_worker;
-  std::lock_guard lock(w.producer);
-  if (!w.started) {
+  if (!w.started.load(std::memory_order_acquire)) {
     return 0;
   }
-  // (only the thread writing a pending immediate-mode draw's data knows it's written)
+  std::lock_guard lock(w.producer);
+  // Always flush any pending immediate-mode draw owned by this thread before
+  // computing the fence / handshake record target so cross-thread GPU steps
+  // never read another thread's in-progress BeginVertices buffer.
   if (w.inl.pending && w.inl.thread == std::this_thread::get_id()) {
     FlushInline();
   }
@@ -9460,7 +9824,7 @@ uint64_t RecordedCalls() {
 }
 
 void WaitForRecordedCalls(uint64_t records) {
-  if (DrawWorkerEnabled() && records) {
+  if (g_worker.started.load(std::memory_order_acquire) && records) {
     WaitForWorker(records);
   }
 }
@@ -9517,18 +9881,51 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
   SendRecord();
 }
 
+void OnLogicFrameBegin() {
+  std::unique_lock lock(g_worker.producer);
+  if (!Recording()) {
+    lock.unlock();
+    std::lock_guard gLock(g_mutex);
+    g_logicFrameCount++;
+    return;
+  }
+  FlushInline();
+  g_worker.record.clear();
+  Put(RecHeader{Rec::kLogicFrame, 0});
+  SendRecord();
+}
+
+bool CurrentPresentModeIsFifo() {
+  int32_t mode = REXCVAR_GET(present_mode);
+  if (rex::cvar::GetFlagSource("present_mode") == rex::cvar::Source::kDefault &&
+      !REXCVAR_GET(vsync)) {
+    mode = 0;
+  }
+  return mode == 1;
+}
+
 void OnSwap(uint32_t device, uint32_t frontBuffer) {
+  const bool isFirstPass = ng2::high_fps::IsRenderThreadFirstPass();
+  const bool vfrFrame = ng2::high_fps::IsActiveFrameVfr();
+  const bool fifoPresent = CurrentPresentModeIsFifo();
+  const bool mightLoop = vfrFrame ? ng2::high_fps::PrepareVfrSwapContinue()
+                                  : ng2::high_fps::DecideSubFrameContinue();
   uint64_t swaps;
+  int64_t estSwapNs = 0;
   {
     std::unique_lock lock(g_worker.producer);
     if (!Recording()) {
       lock.unlock();
-      RunSwap(device, frontBuffer);
+      RunSwap(device, frontBuffer, isFirstPass);
+      if (vfrFrame) {
+        ng2::high_fps::LatchVfrContinueAfterSwap(mightLoop, 0, fifoPresent);
+      }
       return;
     }
     FlushInline();
     SwapArgs a{};
     a.frontBuffer = frontBuffer;
+    a.isFirstPass = isFirstPass ? 1u : 0u;
     std::memcpy(a.format, guest::Virtual(device + kFrontFormat), sizeof(a.format));
     std::memcpy(a.gamma, guest::Virtual(device + kGamma), sizeof(a.gamma));
     if (frontBuffer) {
@@ -9536,18 +9933,49 @@ void OnSwap(uint32_t device, uint32_t frontBuffer) {
     }
     BeginRecord(Rec::kSwap, device);
     Put(a);
+    // Snapshot every Vertex Fetch Slot 94 range touched during this pass into
+    // Rec::kSwap while still under producer lock, before the next sub-frame
+    // pass overwrites 0x83C105D8[slot] in place.
+    Put(uint32_t(g_worker.boneSpans.size()));
+    for (const auto& span : g_worker.boneSpans) {
+      Put(span.address);
+      Put(span.size);
+      Put(guest::Physical(span.address), span.size);
+    }
+    g_worker.boneSpans.clear();
+    g_worker.lastBoneWord0 = 0;
+    g_worker.lastBoneWord1 = 0;
     uint64_t previous = g_worker.lastSwapRecord;
     SendRecord();
     g_worker.lastSwapRecord = g_worker.queued.load(std::memory_order_relaxed);
+    // Slot 94 bones are safely isolated in Rec::kSwap, so WaitForWorker only
+    // bounds the queue to one pass ahead of DrawWorker.
     swaps = previous;
+    estSwapNs = g_worker.avgSwapWorkNs.load(std::memory_order_acquire);
   }
-  // At most one frame ahead of the worker: the previous Swap replayed.
   WaitForWorker(swaps);
+  if (vfrFrame) {
+    ng2::high_fps::LatchVfrContinueAfterSwap(mightLoop, estSwapNs, fifoPresent);
+  }
 }
 
 void OnCreateShader(uint32_t object, uint32_t container, bool pixel) {
-  if (DrawWorkerEnabled()) {
-    WaitForWorker(RecordedCalls());  // (rare: at loads) the worker idle, then at the call
+  auto& w = g_worker;
+  if (w.started.load(std::memory_order_acquire)) {
+    uint64_t target = 0;
+    {
+      std::lock_guard lock(w.producer);
+      // Only flush an inline draw if this thread owns it; a loader thread
+      // creating a shader doesn't own the D3D device and shouldn't read
+      // another thread's in-progress BeginVertices buffer.
+      if (w.inl.pending && w.inl.thread == std::this_thread::get_id()) {
+        FlushInline();
+      }
+      target = w.queued.load(std::memory_order_acquire);
+    }
+    if (target) {
+      WaitForWorker(target);  // (rare: at loads) the worker idle, then at the call
+    }
   }
   RunCreateShader(object, container, pixel);
 }
@@ -9561,6 +9989,7 @@ void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t 
     return;
   }
   FlushInline();
+  NoteBonePaletteFetch(device);
   BeginRecord(Rec::kDraw, device);
   PutSurfaces(device);
   Put(DrawArgs{primitive, startVertex, count, indexed ? 1u : 0u, startIndex});

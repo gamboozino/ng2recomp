@@ -15,6 +15,7 @@
 #include "../aspect.h"
 #include "guest.h"
 #include "video.h"
+#include "../high_fps/high_fps.h"
 
 #include <algorithm>
 #include <functional>
@@ -142,6 +143,9 @@ InterpCapture g_interpCapture;
 
 // What the setting (or NG2_INTERP=1/0, which overrides it) asks for.
 bool InterpWanted() {
+  if (ng2::high_fps::Enabled()) {
+    return false;
+  }
   const char* v = std::getenv("NG2_INTERP");
   if (v && v[0] ? v[0] != '1' : REXCVAR_GET(frame_interpolation) <= 0) {
     return false;

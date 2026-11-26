@@ -70,6 +70,17 @@ name = "Ng2FrameWait"
 address = 0x822F0C68
 name = "Ng2VblankWait"
 
+# Native 120Hz render thread double-pass loop (src/frame_wait.cpp, src/high_fps/).
+[[midasm_hook]]
+address = 0x822F1880
+name = "Ng2RenderSubFrameBegin"
+
+[[midasm_hook]]
+address = 0x822F21B8
+name = "Ng2RenderSubFrameEnd"
+return_on_false = false
+jump_address_on_true = 0x822F1880
+
 # Extras and their cheats (src/extras.cpp).
 # The pad state before the four pads are merged: r5 the first pad's words.
 [[midasm_hook]]

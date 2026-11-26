@@ -28,6 +28,7 @@
 #include "aspect.h"
 #include "gpu/guest.h"
 #include "gpu/video.h"
+#include "high_fps/high_fps.h"
 #include "overlay.h"
 #include "recomp_settings.h"
 
@@ -325,10 +326,24 @@ REX_HOOK_RAW(sub_822F0EF8) {
     g_frames++;
     // NG2_FPS_LOG=1: the game's frame rate in the log once a second.
     if (logFps) {
+      static uint64_t logLastPictures = 0;
       logSeconds += frame;
       logFrames++;
       if (logSeconds >= 1.0) {
-        REXLOG_INFO("fps {:.1f}", logFrames / logSeconds);
+        double logicFps = logFrames / logSeconds;
+        uint64_t pictures = ng2::video::PicturesPresented();
+        if ((ng2::high_fps::IsActive() || ng2::high_fps::IsOverloadDegraded()) &&
+            logLastPictures && pictures > logLastPictures) {
+          double presentedFps = double(pictures - logLastPictures) / logSeconds;
+          REXLOG_INFO("fps {:.1f} (logic {:.1f} tps){}", presentedFps, logicFps,
+                      ng2::high_fps::IsVfrActive()          ? " [VFR]"
+                      : ng2::high_fps::IsOverloadDegraded() ? " [degraded R=1]"
+                                                            : "");
+        } else {
+          REXLOG_INFO("fps {:.1f}{}", logicFps,
+                      ng2::high_fps::IsOverloadDegraded() ? " [degraded R=1]" : "");
+        }
+        logLastPictures = pictures;
         logSeconds = 0.0;
         logFrames = 0;
       }
@@ -344,17 +359,28 @@ REX_HOOK_RAW(sub_822F0EF8) {
   }
   // Averaged over half a second, so it can be read.
   if (g_seconds >= 0.5 || g_shown.empty()) {
+    double logicFps = (g_frames && g_seconds > 0.0) ? double(g_frames) / g_seconds : 0.0;
     double frameTime = g_frames ? g_seconds / g_frames : 0.0;
-    // With interpolation, the pictures shown (its and the game's frames).
+    // With native 120 FPS or frame interpolation, show the real presented rate.
     static uint64_t lastPictures = 0;
     uint64_t pictures = ng2::video::PicturesPresented();
-    if (ng2::video::InterpolationOn() && lastPictures && pictures > lastPictures && g_seconds > 0.0) {
+    bool havePictures = lastPictures && pictures > lastPictures && g_seconds > 0.0;
+    bool native120 = ng2::high_fps::IsActive();
+    if ((native120 || ng2::video::InterpolationOn()) && havePictures) {
       frameTime = g_seconds / double(pictures - lastPictures);
     }
     lastPictures = pictures;
-    std::string text = frameTime > 0.0 ? fmt::format("{:.0f} FPS  {:.1f} ms", 1.0 / frameTime,
-                                                     frameTime * 1000.0)
-                                       : std::string("-- FPS");
+    std::string text;
+    if (frameTime > 0.0) {
+      if (native120 && logicFps > 0.0) {
+        text = fmt::format("{:.0f} FPS ({:.0f} TPS)  {:.1f} ms", 1.0 / frameTime, logicFps,
+                           frameTime * 1000.0);
+      } else {
+        text = fmt::format("{:.0f} FPS  {:.1f} ms", 1.0 / frameTime, frameTime * 1000.0);
+      }
+    } else {
+      text = "-- FPS";
+    }
     g_shown.assign(text.begin(), text.end());
     g_shown.resize(std::min<size_t>(g_shown.size(), kTextChars - 1));
     SetText(g_item, text);

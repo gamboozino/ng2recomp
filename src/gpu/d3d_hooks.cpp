@@ -43,6 +43,7 @@
 #include "native_gpu.h"
 #include "video.h"
 #include "win_display.h"
+#include "../high_fps/high_fps.h"
 
 namespace {
 
@@ -263,6 +264,11 @@ REX_HOOK_RAW(sub_8375F810) {
 REX_EXTERN(__imp__sub_8375FD30);
 REX_HOOK_RAW(sub_8375FD30) {
   if (ng2::video::IsNativeRenderer()) {
+    if (ng2::high_fps::IsVfrActive() && ctx.r6.u32 == 0x8376A380u) {
+      // Force r28 = 0 (D3DPRESENT_INTERVAL_IMMEDIATE) in sub_8376A380 without
+      // mutating guest device+13580 across threads.
+      ctx.r7.u64 &= ~0xF00ull;
+    }
     ng2::gpu::OnCallbackHandshake(ctx.r3.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
   }
   __imp__sub_8375FD30(ctx, base);
@@ -273,6 +279,10 @@ REX_EXTERN(__imp__sub_8376A518);
 REX_HOOK_RAW(sub_8376A518) {
   uint32_t device = ctx.r3.u32, noWait = ctx.r4.u32;
   bool native = ng2::video::IsNativeRenderer();
+  if (native && ng2::high_fps::IsVfrActive()) {
+    noWait = 1;
+    ctx.r4.u64 = 1;
+  }
   if (native) {
     ng2::gpu::OnFlipBegin(device, noWait);
   }

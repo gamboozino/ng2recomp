@@ -38,6 +38,7 @@
 #include <rex/hook.h>
 
 #include "gpu/guest.h"
+#include "high_fps/camera_120hz.h"
 
 REXCVAR_DEFINE_INT32(aspect_ratio, 0, "Display", "0: 16:9, 1: 16:10, 2: 21:9, 3: 32:9, 4: 4:3");
 
@@ -103,9 +104,11 @@ uint32_t g_drawItem = 0;
 struct Anchor {
   int x = 0, y = 0;
   // Placed by the game's projection (already where the widened 3D picture
-  // has it): kept at its own centre (cx, cy), its shape squeezed about that.
+  // has it): kept at its own centre (cx, cy) and shifted by (dx, dy) when
+  // 120 Hz camera steps ahead of 60 Hz logic, its shape squeezed about that.
   bool projected = false;
   float cx = 0.0f, cy = 0.0f;
+  float dx = 0.0f, dy = 0.0f;
 };
 std::unordered_map<uint32_t, Anchor> g_itemAnchor;
 bool g_hud = false;  // the gameplay HUD is up this frame (health bar buckets 57-59)
@@ -264,7 +267,13 @@ Anchor ItemAnchor(float x, float y) {
     } else if (g_drawBucket == kKarmaBucket && x > 2560.0f / 3.0f) {
       a = {1, -1};  // the projectile count, top right
     } else if (g_drawBucket == kKarmaBucket && y > 175.0f && !ComboCounter(x, y)) {
-      a = {0, 0, true, x, y};  // the bow's aiming reticle, where the aim points
+      float x120 = x, y120 = y;
+      float dx = 0.0f, dy = 0.0f;
+      if (ng2::high_fps::camera::ReprojectScreenPoint(x, y, &x120, &y120)) {
+        dx = x120 - x;
+        dy = y120 - y;
+      }
+      a = {0, 0, true, x120, y120, dx, dy};  // the bow's aiming reticle, where the aim points
     } else if (LeftHud(g_drawBucket)) {
       a = {-1, -1};
     } else {
@@ -290,11 +299,9 @@ float MapOffset(float k, int anchor, float size) {
   return anchor < 0 ? 0.0f : anchor > 0 ? size * (1.0f - k) : size * 0.5f * (1.0f - k);
 }
 
-// Squeezes a quad (4 vertices, x and y first) in place. A quad covering the
-// whole screen (a background, a fade) is instead zoomed evenly, about the
-// centre, until it covers the wider (or taller) screen: cropped, not
-// stretched out of shape.
-void SqueezeQuad(uint32_t vertices, uint32_t stride, Squeeze s) {
+// Squeezes and/or 120 Hz re-projects a quad (4 vertices, x and y first) in place.
+// Returns true if any vertex coordinates were modified.
+bool TransformQuad(uint32_t vertices, uint32_t stride, Squeeze s) {
   float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
   for (uint32_t i = 0; i < 4; i++) {
     float x = LoadFloat(vertices + i * stride), y = LoadFloat(vertices + i * stride + 4);
@@ -302,6 +309,9 @@ void SqueezeQuad(uint32_t vertices, uint32_t stride, Squeeze s) {
   }
   float kx = s.x, ky = s.y;
   if (x0 <= 1.0f && x1 >= 1279.0f && y0 <= 1.0f && y1 >= 719.0f) {
+    if (!s.active()) {
+      return false;
+    }
     float cover = 1.0f / std::min(s.x, s.y);
     kx = cover * s.x, ky = cover * s.y;
     for (uint32_t i = 0; i < 4; i++) {
@@ -309,19 +319,45 @@ void SqueezeQuad(uint32_t vertices, uint32_t stride, Squeeze s) {
       StoreFloat(at, Map(LoadFloat(at), kx, 0, 1280.0f));
       StoreFloat(at + 4, Map(LoadFloat(at + 4), ky, 0, 720.0f));
     }
-    return;
+    return true;
   }
   Anchor a = ItemAnchor((x0 + x1) * 0.5f, (y0 + y1) * 0.5f);
+  const bool shifted = a.projected && (a.dx != 0.0f || a.dy != 0.0f);
+  if (!s.active() && !shifted) {
+    return false;
+  }
   for (uint32_t i = 0; i < 4; i++) {
     uint32_t at = vertices + i * stride;
-    float x = LoadFloat(at), y = LoadFloat(at + 4);
-    if (a.projected) {
-      StoreFloat(at, a.cx + (x - a.cx) * kx);
-      StoreFloat(at + 4, a.cy + (y - a.cy) * ky);
-    } else {
-      StoreFloat(at, Map(x, kx, a.x, 1280.0f));
-      StoreFloat(at + 4, Map(y, ky, a.y, 720.0f));
+    float x = LoadFloat(at) + (a.projected ? a.dx : 0.0f);
+    float y = LoadFloat(at + 4) + (a.projected ? a.dy : 0.0f);
+    if (s.active()) {
+      if (a.projected) {
+        x = a.cx + (x - a.cx) * kx;
+        y = a.cy + (y - a.cy) * ky;
+      } else {
+        x = Map(x, kx, a.x, 1280.0f);
+        y = Map(y, ky, a.y, 720.0f);
+      }
     }
+    StoreFloat(at, x);
+    StoreFloat(at + 4, y);
+  }
+  return true;
+}
+
+template <size_t MaxQuadBytes>
+void DrawQuadTransformed(PPCContext& ctx, uint8_t* base, uint32_t vertices, uint32_t stride,
+                         Squeeze s, void (*draw)(PPCContext&, uint8_t*)) {
+  if (!vertices) {
+    draw(ctx, base);
+    return;
+  }
+  uint8_t saved[MaxQuadBytes];
+  std::memcpy(saved, Virtual(vertices), stride * 4);
+  const bool changed = TransformQuad(vertices, stride, s);
+  draw(ctx, base);
+  if (changed) {
+    std::memcpy(Virtual(vertices), saved, stride * 4);
   }
 }
 
@@ -444,6 +480,7 @@ thread_local Taller g_taller;
 
 REX_EXTERN(__imp__sub_822FA8C8);
 REX_HOOK_RAW(sub_822FA8C8) {
+  const uint32_t cam = ctx.r3.u32;
   float aspect = ng2::aspect::Aspect();
   if (LoadFloat(kAspectConstant) != aspect && ng2::aspect::g_constantWritable) {
     StoreFloat(kAspectConstant, aspect);
@@ -455,6 +492,7 @@ REX_HOOK_RAW(sub_822FA8C8) {
     StoreFloat(g_taller.address, g_taller.fov);
   }
   g_taller = outer;
+  ng2::high_fps::camera::OnCameraUpdateEnd(cam);
 }
 
 REX_EXTERN(__imp__sub_822FB378);
@@ -571,39 +609,35 @@ REX_HOOK_RAW(sub_8368EFF8) {
   if (vertices && StorageDeviceHint(vertices)) {
     return;  // (not drawn)
   }
+  constexpr uint32_t kStride = 24, kCount = 4;
   if (vertices) {
     NoteCarouselArrow(vertices);
+    NoteQuad(vertices, kStride);
   }
-  if (!s.active() || !vertices) {
-    if (vertices) {
-      NoteQuad(vertices, 24);
-    }
-    __imp__sub_8368EFF8(ctx, base);
-    return;
-  }
-  constexpr uint32_t kStride = 24, kCount = 4;
-  NoteQuad(vertices, kStride);
-  uint8_t saved[kStride * kCount];
-  std::memcpy(saved, Virtual(vertices), sizeof(saved));
-  SqueezeQuad(vertices, kStride, s);
-  __imp__sub_8368EFF8(ctx, base);
-  std::memcpy(Virtual(vertices), saved, sizeof(saved));
+  DrawQuadTransformed<kStride * kCount>(ctx, base, vertices, kStride, s, __imp__sub_8368EFF8);
 }
 
 // A string's transform.
 REX_EXTERN(__imp__sub_8370DD70);
 REX_HOOK_RAW(sub_8370DD70) {
   Squeeze s = CurrentSqueeze();
-  NotePoint(High(ctx.r10.u64), Low(ctx.r10.u64));
+  float tx = High(ctx.r10.u64), ty = Low(ctx.r10.u64);
+  NotePoint(tx, ty);
+  Anchor a = ItemAnchor(tx, ty);
+  if (a.projected) {
+    tx += a.dx;
+    ty += a.dy;
+  }
   if (s.active()) {
-    Anchor a = ItemAnchor(High(ctx.r10.u64), Low(ctx.r10.u64));
     for (PPCRegister* row : {&ctx.r4, &ctx.r6, &ctx.r8}) {
       row->u64 = Pair(High(row->u64) * s.x, Low(row->u64) * s.y);
     }
     // The translation row.
     float offsetX = a.projected ? a.cx * (1.0f - s.x) : MapOffset(s.x, a.x, 1280.0f);
     float offsetY = a.projected ? a.cy * (1.0f - s.y) : MapOffset(s.y, a.y, 720.0f);
-    ctx.r10.u64 = Pair(High(ctx.r10.u64) * s.x + offsetX, Low(ctx.r10.u64) * s.y + offsetY);
+    ctx.r10.u64 = Pair(tx * s.x + offsetX, ty * s.y + offsetY);
+  } else if (a.projected && (a.dx != 0.0f || a.dy != 0.0f)) {
+    ctx.r10.u64 = Pair(tx, ty);
   }
   __imp__sub_8370DD70(ctx, base);
 }
@@ -668,15 +702,7 @@ REX_HOOK_RAW(sub_8368E500) {
   if (vertices) {
     NoteQuad(vertices, kStride);
   }
-  if (!s.active() || !vertices) {
-    __imp__sub_8368E500(ctx, base);
-    return;
-  }
-  uint8_t saved[kStride * kCount];
-  std::memcpy(saved, Virtual(vertices), sizeof(saved));
-  SqueezeQuad(vertices, kStride, s);
-  __imp__sub_8368E500(ctx, base);
-  std::memcpy(Virtual(vertices), saved, sizeof(saved));
+  DrawQuadTransformed<kStride * kCount>(ctx, base, vertices, kStride, s, __imp__sub_8368E500);
 }
 
 // A clip item (draw method sub_8369FB08: it saves the device's scissor and
@@ -697,7 +723,7 @@ REX_EXTERN(__imp__sub_8375C550);
 REX_HOOK_RAW(sub_8375C550) {
   Squeeze s = CurrentSqueeze();
   uint32_t rect = ctx.r4.u32;
-  if (!s.active() || !g_inClipItem || !g_drawItem || !rect) {
+  if (!g_inClipItem || !g_drawItem || !rect) {
     __imp__sub_8375C550(ctx, base);
     return;
   }
@@ -710,9 +736,22 @@ REX_HOOK_RAW(sub_8375C550) {
     return;
   }
   Anchor a = ItemAnchor((r[0] + r[2]) * 0.5f, (r[1] + r[3]) * 0.5f);
+  const bool shifted = a.projected && (a.dx != 0.0f || a.dy != 0.0f);
+  if (!s.active() && !shifted) {
+    __imp__sub_8375C550(ctx, base);
+    return;
+  }
   auto at = [](float v) { return std::max(0, int32_t(std::lround(v))); };
-  auto mapX = [&](float v) { return a.projected ? a.cx + (v - a.cx) * s.x : Map(v, s.x, a.x, 1280.0f); };
-  auto mapY = [&](float v) { return a.projected ? a.cy + (v - a.cy) * s.y : Map(v, s.y, a.y, 720.0f); };
+  auto mapX = [&](float v) {
+    float p = v + (a.projected ? a.dx : 0.0f);
+    if (!s.active()) return p;
+    return a.projected ? a.cx + (p - a.cx) * s.x : Map(p, s.x, a.x, 1280.0f);
+  };
+  auto mapY = [&](float v) {
+    float p = v + (a.projected ? a.dy : 0.0f);
+    if (!s.active()) return p;
+    return a.projected ? a.cy + (p - a.cy) * s.y : Map(p, s.y, a.y, 720.0f);
+  };
   int32_t mapped[4] = {at(mapX(float(r[0]))), at(mapY(float(r[1]))), at(mapX(float(r[2]))),
                        at(mapY(float(r[3])))};
   auto store = [](uint32_t address, int32_t value) {

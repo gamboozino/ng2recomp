@@ -157,7 +157,7 @@ void Run(HWND hwnd, const std::atomic<bool>* run, int64_t (*now)(), DisplayVblan
     t = now();
     int64_t interval = last ? t - last : 0;
     last = t;
-    if (interval < 4'000'000 || interval > 70'000'000) {
+    if (interval < 1'500'000 || interval > 70'000'000) {
       continue;  // (the first, or a long stall: no measure)
     }
     // A late wake-up that missed a refresh or two isn't a change of rate.

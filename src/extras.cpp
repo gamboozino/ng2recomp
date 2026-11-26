@@ -126,7 +126,10 @@ constexpr uint32_t kLockOn = 0x83B3CB80, kBossGauge = 0x8532E2AC;
 constexpr uint32_t kCharacters = 0x8565B4F0, kCharacterSize = 0x5B10;
 constexpr uint32_t kCharacterHealth = 0x591E, kCharacterX = 0x270, kCharacterZ = 0x278;
 constexpr float kNear = 15.0f;
-constexpr int kHoldFrames = 180;
+constexpr float kHoldSeconds = 3.0f;       // 180 frames at 60 fps
+constexpr float kFadeInPerSec = 4.0f;      // 1/15 per 60 Hz frame (0.25 s)
+constexpr float kFadeOutPerSec = 1.0f;     // 1/60 per 60 Hz frame (1.0 s)
+constexpr float kHudReturnGapSec = 0.5f;   // 30 frames at 60 fps
 
 // Post-Effects off.
 constexpr uint32_t kPostPasses = 0x84C55758;
@@ -212,18 +215,15 @@ void GiveAllWeapons(bool stageStart) {
   }
 }
 
-// The HUD's fade: its alpha, and the frames left before it falls.
+// The HUD's fade: its alpha, and the time left before it falls (wall-clock so
+// Fade Out behaves identically at 60 Hz and native 120 Hz).
 float g_hudFade = 1.0f;
-int g_hudHold = kHoldFrames;
-uint32_t g_hudLastFrame = 0;
+float g_hudHoldSeconds = kHoldSeconds;
+std::chrono::steady_clock::time_point g_hudLastTime{};
 uint16_t g_hudLastHealth = 0;
 
-bool Fighting() {
-  uint32_t device = Load32(kDevice);
-  uint32_t frame = device ? Load32(device + 0x40A0) : 0;
-  uint32_t last = g_hudLastFrame;
-  g_hudLastFrame = frame;
-  if (frame - last > 30) {
+bool Fighting(float rawDt) {
+  if (rawDt > kHudReturnGapSec) {
     return true;  // the HUD back after a while (a pause, a cutscene)
   }
   uint16_t health = Load16(kPlayerHealth);
@@ -248,12 +248,20 @@ bool Fighting() {
 }
 
 void UpdateHudFade() {
-  if (Fighting()) {
-    g_hudHold = kHoldFrames;
-    g_hudFade = std::min(g_hudFade + 1.0f / 15.0f, 1.0f);
-  } else if (--g_hudHold < 0) {
-    g_hudHold = 0;
-    g_hudFade = std::max(g_hudFade - 1.0f / 60.0f, 0.0f);
+  auto now = std::chrono::steady_clock::now();
+  float rawDt = g_hudLastTime != std::chrono::steady_clock::time_point()
+                    ? std::chrono::duration<float>(now - g_hudLastTime).count()
+                    : 0.0f;
+  g_hudLastTime = now;
+  float dt = std::clamp(rawDt, 0.0f, 0.1f);
+  if (Fighting(rawDt)) {
+    g_hudHoldSeconds = kHoldSeconds;
+    g_hudFade = std::min(g_hudFade + dt * kFadeInPerSec, 1.0f);
+  } else {
+    g_hudHoldSeconds = std::max(g_hudHoldSeconds - dt, 0.0f);
+    if (g_hudHoldSeconds <= 0.0f) {
+      g_hudFade = std::max(g_hudFade - dt * kFadeOutPerSec, 0.0f);
+    }
   }
 }
 

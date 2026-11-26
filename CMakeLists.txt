@@ -82,6 +82,10 @@ set(NG2_SOURCES
     src/gpu/win_display.cpp
     src/gpu/menu_label.cpp
     src/gpu/prompts.cpp
+    src/high_fps/high_fps.cpp
+    src/high_fps/input_120hz.cpp
+    src/high_fps/camera_120hz.cpp
+    src/high_fps/state_bridge.cpp
     src/controls.cpp
     src/extras.cpp
     src/storage_prompt.cpp
@@ -121,6 +125,11 @@ endif()
 rexglue_setup_target(ng2 GPU_PLUGINS xenos)
 set(NG2_VERSION_SUFFIX "" CACHE STRING "Appended to the version shown (test builds)")
 target_compile_definitions(ng2 PRIVATE NG2_VERSION="${PROJECT_VERSION}${NG2_VERSION_SUFFIX}")
+target_include_directories(ng2 PRIVATE
+    thirdparty/rexglue-sdk/thirdparty/imgui
+    thirdparty/rexglue-sdk/thirdparty/xxHash
+    thirdparty/rexglue-sdk/thirdparty/o1heap/o1heap
+)
 
 # The SDK sets an $ORIGIN rpath on Linux but only stages its shared runtime
 # libraries on Windows and macOS.
@@ -160,6 +169,12 @@ if(CMAKE_CROSSCOMPILING)
 else()
     add_executable(ng2_dump_image tools/dump_image/main.cpp)
     target_link_libraries(ng2_dump_image PRIVATE rex::runtime)
+    if(WIN32)
+        add_custom_command(TARGET ng2_dump_image POST_BUILD
+            COMMAND "$<$<BOOL:$<TARGET_RUNTIME_DLLS:ng2_dump_image>>:${CMAKE_COMMAND};-E;copy_if_different;$<TARGET_RUNTIME_DLLS:ng2_dump_image>;$<TARGET_FILE_DIR:ng2_dump_image>>"
+            COMMAND_EXPAND_LISTS
+            VERBATIM)
+    endif()
 
     include(ExternalProject)
     ExternalProject_Add(xenos_recomp
@@ -171,7 +186,7 @@ else()
             -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
             -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
             -DXENOS_RECOMP_DXIL=OFF
-        BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+        BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp${CMAKE_EXECUTABLE_SUFFIX}"
         INSTALL_COMMAND ""
         BUILD_ALWAYS ON)
 
@@ -182,12 +197,12 @@ else()
         COMMAND ${CMAKE_COMMAND} -E make_directory "${NG2_SHADER_DIR}/input"
         COMMAND ng2_dump_image "${NG2_GAME_DIR}" default.xex "${NG2_SHADER_DIR}/input/default.img"
         COMMAND ${CMAKE_COMMAND} -E env ${NG2_XENOS_RECOMP_ENV}
-            "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+            "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp${CMAKE_EXECUTABLE_SUFFIX}"
             "${NG2_SHADER_DIR}/input" "${NG2_SHADER_CACHE}"
             "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
         DEPENDS ng2_dump_image xenos_recomp "${NG2_GAME_DIR}/default.xex"
             "${NG2_GAME_DIR}/default.xexp"
-            "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+            "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp${CMAKE_EXECUTABLE_SUFFIX}"
             "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
         COMMENT "Translating NG2 shaders with XenosRecomp"
         VERBATIM)
@@ -227,6 +242,13 @@ if(WIN32)
     foreach(_lib avformat avcodec avutil swresample swscale)
         target_link_libraries(ng2 PRIVATE "${NG2_FFMPEG_DIR}/lib/${_lib}.lib")
     endforeach()
+    file(GLOB _ffmpeg_dlls "${NG2_FFMPEG_DIR}/bin/*.dll")
+    if(_ffmpeg_dlls)
+        add_custom_command(TARGET ng2 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_ffmpeg_dlls} $<TARGET_FILE_DIR:ng2>
+            VERBATIM)
+    endif()
 else()
     pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
         libavformat libavcodec libavutil libswresample libswscale)
@@ -259,6 +281,13 @@ set(NG2_INTERNAL_SHADERS
     "depth_copy_ms_ps:ps_6_0"
     "debug_ps:ps_6_0"
 )
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+    set(NG2_DXC_ENV "")
+    set(NG2_DXC_BIN "${NG2_DXC_DIR}/bin/x64/dxc.exe")
+else()
+    set(NG2_DXC_ENV ${CMAKE_COMMAND} -E env "LD_LIBRARY_PATH=${NG2_DXC_DIR}/lib/x64")
+    set(NG2_DXC_BIN "${NG2_DXC_DIR}/bin/x64/dxc-linux")
+endif()
 set(NG2_INTERNAL_SHADER_SOURCES "")
 foreach(_entry ${NG2_INTERNAL_SHADERS})
     string(REPLACE ":" ";" _parts "${_entry}")
@@ -270,8 +299,8 @@ foreach(_entry ${NG2_INTERNAL_SHADERS})
     add_custom_command(
         OUTPUT "${_cpp}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${NG2_SHADER_DIR}/internal"
-        COMMAND ${CMAKE_COMMAND} -E env "LD_LIBRARY_PATH=${NG2_DXC_DIR}/lib/x64"
-            "${NG2_DXC_DIR}/bin/x64/dxc-linux" -T ${_profile} -E main -spirv
+        COMMAND ${NG2_DXC_ENV}
+            "${NG2_DXC_BIN}" -T ${_profile} -E main -spirv
             -fvk-use-dx-layout -HV 2021 -Qstrip_debug -Fo "${_spv}" "${_hlsl}"
         COMMAND ${CMAKE_COMMAND} -DINPUT=${_spv} -DOUTPUT=${_cpp} -DNAME=g_${_name}
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"

@@ -28,6 +28,7 @@
 #include <rex/ppc/context.h>
 
 #include "gpu/guest.h"
+#include "high_fps/camera_120hz.h"
 
 REXCVAR_DEFINE_BOOL(modern_camera, false, "Gameplay",
                     "The camera of Master Edition, from the modern versions of the game");
@@ -161,6 +162,7 @@ REX_HOOK_RAW(sub_823039D0) {
       std::memcpy(Virtual(part + 384), Virtual(kPresetTable + kFollowPreset * kPresetSize), kPresetSize);
     }
   }
+  ng2::high_fps::camera::OnFollowCameraTick(ctx.r3.u32, Modern(), false);
   if (Modern()) {
     // Their camera's speed (0x859F3904, 1-10; 0 reads as 5) from the game's Camera Speed
     // slider (profile byte 63, 0-100), as a piece of their glue does: without it the camera
@@ -249,6 +251,7 @@ REX_HOOK_RAW(sub_82312F80) {
   const uint8_t kind = Load8(0x84EF25F5);
   if (uint32_t(ctx.lr) != 0x822FF098 || !REXCVAR_GET(free_camera_ot_ut) ||
       (kind != 11 && kind != 111 && kind != 114) || Load32(0x859FA218) != 0) {
+    ng2::high_fps::camera::OnActionCameraTick(ctx.r3.u32, false);
     __imp__sub_82312F80(ctx, base);
     return;
   }
@@ -289,6 +292,7 @@ REX_HOOK_RAW(sub_82312F80) {
   std::memcpy(Virtual(camera + 48), Virtual(kActionSave), sizeof(body));
   std::memcpy(Virtual(camera + 816), Virtual(kActionSave + sizeof(body)), sizeof(tail));
   std::memcpy(Virtual(camera), head, sizeof(head));
+  ng2::high_fps::camera::OnActionCameraTick(camera, true);
   ctx.r3.u64 = camera;
   sub_823039D0(ctx, base);
   Store32(kActionFlag, 0);

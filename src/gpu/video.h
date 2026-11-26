@@ -28,6 +28,9 @@ void DestroyHostDevice();
 void SetPipelineListPath(const std::filesystem::path& path);
 // The game starting a frame (for NG2_LATENCY_LOG).
 void MarkFrameStart();
+// Called once at Pass 0 entry of each 60 Hz logic frame to advance g_logicFrameCount
+// in lockstep with draw records across 60 FPS, Fixed 120, and VFR modes.
+void OnLogicFrameBegin();
 
 // A full-screen movie's frame (Y, U, V planes, 4:2:0), shown instead of the
 // game's picture while frames keep coming.
@@ -76,6 +79,10 @@ bool DrainRequested();
 // The display's last refresh and period (steady_clock ns), from the
 // presents reaching the screen; false unless steady and recent.
 bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs);
+// The display mode's refresh period (SDL), 0 if not known yet.
+int64_t ModeRefreshNs();
+// The display mode's refresh rate in Hz (SDL), 0.0 if not known yet.
+double DisplayModeHz();
 // With V-Sync FIFO, the display's queue has run dry: the last half second's
 // swapchain acquires didn't block (native_gpu.cpp's timer refills it).
 bool PresentQueueDrained();

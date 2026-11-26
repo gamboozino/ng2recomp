@@ -120,6 +120,7 @@ struct Player {
   std::vector<std::pair<uint32_t, uint32_t>> reserved;  // (address, attributes)
   bool reportedEnd = false;
   bool blanked = false;  // its planes cleared to black
+  bool isFullScreen = false;
   std::vector<uint8_t> fullScreen[3];  // a full-screen movie's Y, U, V
 };
 
@@ -245,6 +246,16 @@ bool AnyPlaying() {
   std::lock_guard lock(g_mutex);
   for (const auto& [object, player] : g_players) {
     if (player.movie && !player.reportedEnd) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AnyFullscreenPlaying() {
+  std::lock_guard lock(g_mutex);
+  for (const auto& [object, player] : g_players) {
+    if (player.isFullScreen && player.movie && !player.reportedEnd) {
       return true;
     }
   }
@@ -404,6 +415,7 @@ REX_HOOK_RAW(sub_836A41B8) {
   {
     std::lock_guard lock(g_mutex);
     if (Player* player = Find(ctx.r3.u32)) {
+      player->isFullScreen = true;
       bool playing = false;
       if (player->movie) {
         // Decoded into host planes of ours, and shown by the renderer in
