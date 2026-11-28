@@ -358,8 +358,37 @@ constexpr OtherHeader kOtherHeaders[] = {
 };
 constexpr float kHeaderScale = 0.92f;  // header letters / atlas letters
 constexpr uint32_t kHeaderTop = 14, kHeaderMargin = 12;
-constexpr int kGlowRadius = 4;
-constexpr float kGlowLevel = 70.0f;
+constexpr int kGlowRadius = 6;
+// The header's palette is sorted by brightness, its alpha all over the place
+// from one entry to the next (15: 237, 18: 44), so a smooth run of values came
+// out speckled (#170). Ours takes only the entries the game's headers use:
+// for the glow, those that make a smooth dark red ramp, by alpha (as the
+// Options header's, out to about 13 pixels from the letters); for the
+// outline, dark reds (kOutline).
+struct GlowStep {
+  uint8_t index, alpha;
+};
+constexpr GlowStep kGlowRamp[] = {
+    {0, 0},    {1, 2},    {2, 5},    {3, 8},    {4, 11},   {5, 14},   {6, 17},   {7, 20},
+    {8, 23},   {9, 26},   {10, 29},  {11, 32},  {12, 35},  {13, 38},  {14, 41},  {18, 44},
+    {19, 47},  {20, 50},  {21, 53},  {24, 57},  {29, 64},  {36, 70},  {37, 76},  {40, 81},
+    {50, 88},  {51, 93},  {53, 99},  {55, 104}, {64, 111},
+};
+constexpr float kGlowAlpha = 111.0f;  // next to the letters
+constexpr float kGlowGain = 2.2f;     // (the blurred letters are about 0.5 at their edge)
+// (as the Options header's next to its letters: dark reds, opaque, then half
+// clear; the greyer near-opaque entries, 96 and up, came out as grey flecks)
+constexpr uint8_t kOutline[] = {28, 34, 46, 60, 91, 64, 55};
+
+uint8_t GlowIndex(float alpha) {
+  const GlowStep* best = &kGlowRamp[0];
+  for (const GlowStep& step : kGlowRamp) {
+    if (std::fabs(float(step.alpha) - alpha) < std::fabs(float(best->alpha) - alpha)) {
+      best = &step;
+    }
+  }
+  return best->index;
+}
 
 // The in-game list's header ("IN-GAME MANUAL AND OPTIONS", 521x58), in the
 // same lettering at the same size and place: ours goes in as it is, the rest
@@ -416,6 +445,32 @@ bool MakeHeader(std::vector<uint8_t>& out, uint32_t& outWidth) {
   if (!Compose(kText, label.data())) {
     return false;
   }
+  // Only the outline within 2 pixels of a face: the title's labels carry a
+  // drop shadow and their source words' neighbours' edges further out (a
+  // ragged strip by the P), which the Options header's letters don't have.
+  {
+    std::vector<uint8_t> kept = label;
+    for (int y = 0; y < int(kBand); y++) {
+      for (int x = 0; x < int(kWidth); x++) {
+        uint8_t v = label[y * kWidth + x];
+        if (!IsLetter(v) || IsFace(v)) {
+          continue;
+        }
+        bool near = false;
+        for (int dy = -2; dy <= 2 && !near; dy++) {
+          for (int dx = -2; dx <= 2 && !near; dx++) {
+            int nx = x + dx, ny = y + dy;
+            near = dx * dx + dy * dy <= 5 && nx >= 0 && nx < int(kWidth) && ny >= 0 && ny < int(kBand) &&
+                   IsFace(label[ny * kWidth + nx]);
+          }
+        }
+        if (!near) {
+          kept[y * kWidth + x] = kPlate;
+        }
+      }
+    }
+    label.swap(kept);
+  }
   uint32_t x0 = kWidth, x1 = 0, y0 = kBand, y1 = 0;
   for (uint32_t y = 0; y < kBand; y++) {
     for (uint32_t x = 0; x < kWidth; x++) {
@@ -454,17 +509,51 @@ bool MakeHeader(std::vector<uint8_t>& out, uint32_t& outWidth) {
       }
     }
   }
+  // Pieces of letter under 40 pixels (a whole letter is far more): scraps of
+  // a neighbour in the source lettering, as the ragged strip by the P; left
+  // to the glow.
+  {
+    std::vector<int> piece(size, -1);
+    std::vector<uint32_t> stack, members;
+    for (uint32_t start = 0; start < size; start++) {
+      if (mask[start] == 0.0f || piece[start] >= 0) {
+        continue;
+      }
+      members.clear();
+      stack.assign(1, start);
+      piece[start] = int(start);
+      while (!stack.empty()) {
+        uint32_t i = stack.back();
+        stack.pop_back();
+        members.push_back(i);
+        uint32_t x = i % outWidth, y = i / outWidth;
+        const uint32_t next[4] = {x > 0 ? i - 1 : i, x + 1 < outWidth ? i + 1 : i, y > 0 ? i - outWidth : i,
+                                  y + 1 < kHeaderHeight ? i + outWidth : i};
+        for (uint32_t j : next) {
+          if (j != i && mask[j] > 0.0f && piece[j] < 0) {
+            piece[j] = int(start);
+            stack.push_back(j);
+          }
+        }
+      }
+      if (members.size() < 40) {
+        for (uint32_t i : members) {
+          mask[i] = 0.0f;
+        }
+      }
+    }
+  }
   std::vector<float> glow = Blur(Blur(mask, outWidth, kHeaderHeight), outWidth, kHeaderHeight);
   out.resize(size);
   for (uint32_t i = 0; i < size; i++) {
-    float v;
-    if (mask[i] > 0.0f) {
-      v = value[i] >= 110.0f ? 150.0f + (value[i] - 110.0f) * (105.0f / 145.0f)  // face
-                             : 30.0f + value[i] * 0.7f;                         // outline
+    if (mask[i] > 0.0f && value[i] >= 110.0f) {  // face
+      out[i] = uint8_t(std::clamp(150.0f + (value[i] - 110.0f) * (105.0f / 145.0f), 0.0f, 255.0f));
+    } else if (mask[i] > 0.0f) {  // outline
+      size_t k = size_t(std::clamp(value[i], 0.0f, 109.0f) / 110.0f * float(std::size(kOutline)));
+      out[i] = kOutline[std::min(k, std::size(kOutline) - 1)];
     } else {
-      v = glow[i] * kGlowLevel;
+      out[i] = GlowIndex(std::min(1.0f, glow[i] * kGlowGain) * kGlowAlpha);
     }
-    out[i] = uint8_t(std::clamp(v, 0.0f, 255.0f));
   }
   return true;
 }
