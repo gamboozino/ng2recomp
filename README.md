@@ -277,6 +277,17 @@ Delete deletes a save.
 
 These are the defaults: RECOMP SETTINGS' Controls page sets each action's keys and controller button.
 
+## Fixes to the original game
+
+Bugs the original game has too, fixed here:
+
+- Chapter 6, before the church: columns and spires flickered and some walls let Ryu walk through.
+  Two overlapping rooms were both drawn, one with plain stand-ins for the other's detail; the
+  stand-ins are now hidden while the detailed room is loaded (#59, #60).
+- Chapter 6: going back to a room with IS Ninjas still around could crash. A reused object slot ran
+  the old object's scripts from data the new room had already overwritten; the console's slower
+  disc hid it (#94).
+
 ## Known issues
 
 - Some cutscenes may have slight audio delays.
