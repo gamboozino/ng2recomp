@@ -1,4 +1,4 @@
-![Ninja Gaiden II Recompiled](docs/images/banner.jpg)
+![Ninja Gaiden II Recompiled](docs/images/banner.png)
 
 # Ninja Gaiden II Recompiled
 
@@ -385,7 +385,7 @@ If you'd like to support the project: [GitHub Sponsors](https://github.com/spons
   research on some optimizations, and the busy-wait loop detection of the recompiled code (MIT)
 - [Xenia Edge](https://github.com/has207/xenia-edge) by has207: a reference for how the game
   should look and behave, and its GPU traces for comparing frames with the native renderer
-- Banner lettering: Chakra Petch by Cadson Demak (SIL Open Font License)
+- Banner lettering: RECOMPILED in Cinzel by Natanael Gama (SIL Open Font License)
 
 *Ninja Gaiden* is a trademark of Koei Tecmo. This project is not affiliated with or endorsed by Koei
 Tecmo or Team Ninja.
