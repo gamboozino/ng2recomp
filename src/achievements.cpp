@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/system/achievement_manager.h>
 #include <rex/system/kernel_state.h>
@@ -26,6 +27,7 @@
 #include <rex/ui/image_decode.h>
 
 #include "game_icon.h"
+#include "gpu/guest.h"
 #include "gpu/video.h"
 #include "lock_icon.h"
 #include "overlay.h"
@@ -584,3 +586,38 @@ bool Frame() {
 }
 
 }  // namespace ng2::achievements
+
+// The game's achievement check (sub_837211E8, on its achievement thread):
+// for each achievement it earned but hasn't seen unlocked, it asks the
+// unlocked list again, and again, until the achievement shows up. On the
+// Xbox a write always unlocks it, so that ends at once. While cheats are
+// unlocked the write is refused and it never shows up, so the game kept the
+// list request going every few frames for the rest of the session; the
+// stuck mission clear screens and chapter loading screens (#169, #173) came
+// with that loop, and 0.8.1 (no refusal) had neither. Now the check runs only when one of those
+// achievements really is unlocked here; refused ones keep their earned mark
+// (the profile's) and are written again later.
+REX_EXTERN(__imp__sub_837211E8);
+REX_HOOK_RAW(sub_837211E8) {
+  using ng2::guest::Load32;
+  using ng2::guest::Virtual;
+  constexpr uint32_t kProfile = 0x84C559E0;  // -> profile: seen +720, earned +780 (achievements 0-59)
+  constexpr uint32_t kIds = 0x83AA6B20;      // u8 id per achievement, 70
+  const uint32_t task = ctx.r3.u32;
+  const uint32_t profile = Load32(kProfile);
+  auto* kernel = Kernel();
+  if (task < 0x80000000u || !profile || !kernel || Load32(task + 12) != 2) {
+    __imp__sub_837211E8(ctx, base);
+    return;
+  }
+  // (60-69 live in the task: seen +34, earned +44)
+  auto seen = [&](uint32_t i) { return *Virtual(i < 60 ? profile + 720 + i : task + 34 + i); };
+  auto earned = [&](uint32_t i) { return *Virtual(i < 60 ? profile + 780 + i : task + 44 + i); };
+  for (uint32_t i = 0; i < 70; ++i) {
+    if (!seen(i) && earned(i) && kernel->achievements().IsUnlocked(*Virtual(kIds + i))) {
+      __imp__sub_837211E8(ctx, base);
+      return;
+    }
+  }
+}
+
